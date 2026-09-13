@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+
+# Venv (generato da install.sh)
+venv/
+.venv/
+
+# Backup e log locali
+*.bak
+*.bak[0-9]*
+*.bak_*
+loki_debug.log
+*.log
+
+# Session e memoria (dati utente locali, mai su repo)
+.loki_sessions/
+.loki_memory.md
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

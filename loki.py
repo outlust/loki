@@ -234,6 +234,23 @@ tools_schema = [
     },
 ]
 
+_SEC_TOOLS = {
+    'http_probe', 'encode_decode', 'hash_data',
+    'identify_hash', 'file_entropy', 'check_linux_privesc',
+}
+
+def get_active_tools():
+    """Return base tools; security persona also gets loki_sec tools."""
+    schema = list(tools_schema)
+    if ACTIVE_PERSONA == 'security':
+        try:
+            import loki_sec
+            schema.extend(loki_sec.SECURITY_TOOLS_SCHEMA)
+        except ImportError:
+            pass
+    return schema
+
+
 class SlashOnlyCompleter(Completer):
     def get_completions(self, document, complete_event):
         text = document.text_before_cursor
@@ -1247,7 +1264,7 @@ def parse_slash(text, messages=None):
     if cmd == '/tools':
         print()
         print(f"  {c('AVAILABLE TOOLS', BOLD)}")
-        for tool in tools_schema:
+        for tool in get_active_tools():
             fn = tool['function']
             name = fn['name']
             desc = fn['description'].split('.')[0]
@@ -1598,7 +1615,7 @@ def stream_response(messages):
         stream = ollama.chat(
             model=MODEL,
             messages=prepare_messages_for_api(messages),
-            tools=tools_schema,
+            tools=get_active_tools(),
             think=True,
             stream=True,
             options={'num_ctx': stats['working_ctx']},
@@ -1777,6 +1794,13 @@ def _run_turn(state):
                         )
                     else:
                         output = f"ERROR: malformed write_file arguments: {args}"
+                elif tool_name in _SEC_TOOLS:
+                    try:
+                        import loki_sec
+                        fn = getattr(loki_sec, tool_name)
+                        output = fn(**(args if isinstance(args, dict) else {}))
+                    except Exception as e:
+                        output = f"ERROR calling {tool_name}: {e}"
                 else:
                     output = f"ERROR: unknown tool: {tool_name}"
                 messages.append({"role": "tool", "content": output})

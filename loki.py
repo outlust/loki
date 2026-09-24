@@ -235,8 +235,12 @@ tools_schema = [
 ]
 
 _SEC_TOOLS = {
-    'http_probe', 'encode_decode', 'hash_data',
-    'identify_hash', 'file_entropy', 'check_linux_privesc',
+    'http_probe', 'encode_decode', 'hash_data', 'identify_hash',
+    'file_entropy', 'check_linux_privesc',
+    'port_scan', 'dns_enum', 'web_fingerprint', 'dir_bruteforce',
+    'jwt_decode', 'generate_payload', 'net_recon', 'cred_harvest',
+    'generate_persist', 'kernel_suggest', 'exfil_payload',
+    'sqli_probe', 'lfi_probe',
 }
 
 def get_active_tools():

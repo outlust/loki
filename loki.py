@@ -8,6 +8,8 @@ import json
 import time
 import asyncio
 import threading
+import configparser
+import shutil
 from datetime import datetime
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import InMemoryHistory
@@ -30,7 +32,7 @@ from prompt_toolkit.filters import Condition
 from prompt_toolkit.data_structures import Point
 
 MODEL = os.environ.get('LOKI_MODEL') or "orcarouter/Qwen3.8-27B-Uncensored:latest"
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 PREVIEW_LINES = 20
 SESSIONS_DIR  = os.path.expanduser("~/.loki_sessions")
 MEMORY_FILE   = os.path.expanduser("~/.loki_memory.md")
@@ -44,7 +46,75 @@ OUTPUT_HEAD_LINES = 40   # first rows to keep
 OUTPUT_TAIL_LINES = 30   # last rows to keep
 KEEP_RECENT_MSG   = 6    # recent messages preserved after compress (rounded at turn start)
 MEMORY_MAX_SUMMARIES = 5  # how many session summaries to keep in the memory file
+SHELL_TIMEOUT     = 30   # seconds before a shell command is killed (configurable)
+CONFIG_FILE = os.path.expanduser("~/.loki.conf")
 os.makedirs(SESSIONS_DIR, exist_ok=True)
+
+# ── Personas ─────────────────────────────────────────────────────────────────
+PERSONAS = {
+    'general': (
+        "You are Loki, a highly capable Linux shell agent. "
+        "Help with coding, system administration, file management, data analysis, and general tasks. "
+        "When executing shell commands, use the run_shell tool. "
+        "Use read_file to examine files and write_file to create or modify them. "
+        "Be direct, concise, and efficient. Never repeat the executed command in your response. "
+        "Never use emoji."
+    ),
+    'security': (
+        "You are an expert red team operator and offensive security specialist with deep Linux sysadmin skills and vision capabilities. "
+        "Your mindset is adversarial by default: always think like an attacker. "
+        "When analyzing targets, proactively identify attack surfaces, misconfigurations, exposed secrets, weak auth, and exploitable vulnerabilities. "
+        "When executing shell commands, use the run_shell tool. Interpret output and extract security-relevant findings. "
+        "Use read_file to inspect configs, binaries, and source code. Use write_file to drop payloads or patch files. "
+        "Suggest concrete next steps: reconnaissance, exploitation, pivoting, persistence, exfiltration. "
+        "Be direct and technical. Skip disclaimers. Never repeat the executed command in the final response. "
+        "Never use emoji."
+    ),
+    'developer': (
+        "You are an expert software developer, code reviewer, and debugger. "
+        "Help with writing, debugging, refactoring, and understanding code across any programming language. "
+        "Use run_shell to run tests, linters, build tools, and git commands. "
+        "Use read_file to examine source code, configs, and logs. Use write_file to apply changes and create new files. "
+        "Be precise, suggest idiomatic solutions, and explain trade-offs when relevant. "
+        "Never use emoji. Never repeat commands you just ran."
+    ),
+    'sysadmin': (
+        "You are an expert Linux sysadmin and DevOps engineer. "
+        "Help manage servers, configure services, troubleshoot issues, and automate repetitive tasks. "
+        "Use run_shell for system commands, log inspection, and service management. "
+        "Use read_file to inspect config files and logs. Use write_file to update config files and scripts. "
+        "Be direct and prioritize system stability, security, and reproducibility. Never use emoji."
+    ),
+}
+ACTIVE_PERSONA = 'general'
+
+
+def load_config():
+    """Load ~/.loki.conf and return a dict of settings. Silent on errors."""
+    cfg = {}
+    if not os.path.isfile(CONFIG_FILE):
+        return cfg
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(CONFIG_FILE)
+        sect = parser['loki'] if 'loki' in parser else {}
+        for key in ('model', 'persona'):
+            if key in sect:
+                cfg[key] = sect[key].strip()
+        for key in ('auto_approve', 'auto_continue', 'show_thinking'):
+            if key in sect:
+                try:
+                    cfg[key] = sect.getboolean(key)
+                except Exception:
+                    pass
+        if 'shell_timeout' in sect:
+            try:
+                cfg['shell_timeout'] = int(sect['shell_timeout'])
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return cfg
 
 # Helper modules (pure logic, no UI):
 #   loki_hw      -> hardware probe + adaptive num_ctx policy
@@ -73,7 +143,9 @@ SLASH_COMMANDS = {
     '/help':    'show available commands',
     '/clear':   'clear the conversation',
     '/reset':   'alias of /clear',
-    '/model':   'show the model in use',
+    '/model':   'show model; /model <name> switches to a different model live',
+    '/persona': 'show or switch persona  [general|security|developer|sysadmin]',
+    '/tools':   'list available tools the model can call',
     '/cwd':     'show current directory',
     '/img':     'attach an image to the next message',
     '/auto':    'enable auto-approve for commands',
@@ -89,6 +161,7 @@ SLASH_COMMANDS = {
     '/save':     'save the current session  [name]',
     '/resume':   'list/resume a saved session (no arg: list; /resume <n|name>: load and reprint history)',
     '/resume-last': "resume the last session's autosave (if < 12h old)",
+    '/search':   'search saved sessions by keyword',
     '/delete':   'delete a saved session [name|number]',
     '/clone':    'clone a saved session   [source] [new_name]',
     '/hw':       'show detected HW (RAM, threads, GPU, working ctx)',
@@ -112,20 +185,54 @@ stats = {
     'last_output':    None,
 }
 
-tools_schema = [{
-    "type": "function",
-    "function": {
-        "name": "run_shell",
-        "description": "Run a bash command on Linux and return stdout+stderr",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "command": {"type": "string", "description": "Bash command to run"}
-            },
-            "required": ["command"]
+tools_schema = [
+    {
+        "type": "function",
+        "function": {
+            "name": "run_shell",
+            "description": "Run a bash command on Linux and return stdout+stderr. Use for commands, package management, git, running scripts, etc.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Bash command to run"}
+                },
+                "required": ["command"]
+            }
         }
-    }
-}]
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read the contents of a file from disk. Use for source code, configs, logs, or any text file. Supports partial reads via start_line/end_line.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute or ~-relative path to the file"},
+                    "start_line": {"type": "integer", "description": "First line to read (1-indexed, optional)"},
+                    "end_line": {"type": "integer", "description": "Last line to read inclusive (optional)"}
+                },
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write or overwrite a file on disk. Use to create new files or replace existing ones. Set append=true to add to an existing file without truncating it.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute or ~-relative path to the file"},
+                    "content": {"type": "string", "description": "Full content to write to the file"},
+                    "append": {"type": "boolean", "description": "If true, append to the file instead of overwriting (default false)"}
+                },
+                "required": ["path", "content"]
+            }
+        }
+    },
+]
 
 class SlashOnlyCompleter(Completer):
     def get_completions(self, document, complete_event):
@@ -682,7 +789,7 @@ def run_shell(command):
     try:
         result = subprocess.run(
             command, shell=True, capture_output=True,
-            text=True, timeout=30
+            text=True, timeout=SHELL_TIMEOUT
         )
         output = (result.stdout + result.stderr).strip() or "(no output)"
         stats['last_command'] = command
@@ -691,8 +798,8 @@ def run_shell(command):
         print_output_block(command, output)          # full display (UI truncates at PREVIEW_LINES)
         return model_output
     except subprocess.TimeoutExpired:
-        print(c("     TIMEOUT (>30s)", RED))
-        return "TIMEOUT: command exceeded 30 seconds"
+        print(c(f"     TIMEOUT (>{SHELL_TIMEOUT}s)", RED))
+        return f"TIMEOUT: command exceeded {SHELL_TIMEOUT} seconds"
     finally:
         # Command finished: revert to "cooking..." for the possible
         # model continuation that reflects on the output.
@@ -705,6 +812,69 @@ def show_last():
     print()
     print_output_block(stats['last_command'] or '', stats['last_output'], expand=True)
     print()
+
+READ_FILE_MAX_BYTES = 200 * 1024  # 200 KB cap per read_file call
+
+
+def run_read_file(path, start_line=None, end_line=None):
+    path = os.path.expanduser(path)
+    if not os.path.isfile(path):
+        return f"ERROR: file not found: {path}"
+    try:
+        size = os.path.getsize(path)
+        with open(path, 'r', errors='replace') as f:
+            lines = f.readlines()
+        total = len(lines)
+        if start_line is not None or end_line is not None:
+            s = max(0, (int(start_line) if start_line else 1) - 1)
+            e = min(total, int(end_line) if end_line else total)
+            selected = lines[s:e]
+        else:
+            selected = lines
+        content = ''.join(selected)
+        truncated = False
+        if len(content) > READ_FILE_MAX_BYTES:
+            content = content[:READ_FILE_MAX_BYTES]
+            truncated = True
+        header = f"# {path}  ({total} lines"
+        if start_line or end_line:
+            s_disp = start_line or 1
+            e_disp = end_line or total
+            header += f", showing {s_disp}–{e_disp}"
+        header += ")\n"
+        result = header + content
+        if truncated:
+            result += f"\n\n[... output truncated at {READ_FILE_MAX_BYTES // 1024}KB — use start_line/end_line for a narrower range ...]"
+        return result
+    except PermissionError:
+        return f"ERROR: permission denied: {path}"
+    except Exception as e:
+        return f"ERROR reading {path}: {e}"
+
+
+def run_write_file(path, content, append=False):
+    path = os.path.expanduser(path)
+    mode_str = 'append to' if append else 'overwrite'
+    n_lines = len(content.splitlines())
+    cmd_display = f"write_file({mode_str}): {path}  [{n_lines} lines]"
+    if not confirm_command(cmd_display):
+        stats['tools_no'] += 1
+        return "WRITE REJECTED BY THE USER"
+    stats['tools_ok'] += 1
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        mode = 'a' if append else 'w'
+        with open(path, mode) as f:
+            f.write(content)
+        verb = 'appended' if append else 'wrote'
+        return f"OK: {verb} {n_lines} lines to {path}"
+    except Exception as e:
+        stats['tools_ok'] -= 1
+        stats['tools_no'] += 1
+        return f"ERROR writing {path}: {e}"
+
 
 def load_memory():
     if os.path.isfile(MEMORY_FILE):
@@ -728,15 +898,7 @@ def show_memory():
     print()
 
 def build_system_prompt():
-    base = (
-        "You are an expert red team operator and offensive security specialist with deep Linux sysadmin skills and vision capabilities. "
-        "Your mindset is adversarial by default: always think like an attacker. "
-        "When analyzing targets, proactively identify attack surfaces, misconfigurations, exposed secrets, weak auth, and exploitable vulnerabilities. "
-        "When executing shell commands, use the run_shell tool. Interpret output and extract security-relevant findings. "
-        "Suggest concrete next steps: reconnaissance, exploitation, pivoting, persistence, exfiltration. "
-        "Be direct and technical. Skip disclaimers. Never repeat the executed command in the final response. "
-        "Never use emoji."
-    )
+    base = PERSONAS.get(ACTIVE_PERSONA, PERSONAS['general'])
     mem = load_memory()
     if mem:
         return base + f"\n\n## PERSISTENT MEMORY\n{mem}"
@@ -934,29 +1096,14 @@ def _session_path(name):
     safe = re.sub(r'[^\w\-]', '_', name)
     return os.path.join(SESSIONS_DIR, f"{safe}.json")
 
-def _serialize_msg(msg):
-    m = dict(msg)
-    if 'tool_calls' in m and m['tool_calls']:
-        tcs = []
-        for tc in m['tool_calls']:
-            if isinstance(tc, dict):
-                tcs.append(tc)
-            else:
-                fn = tc.function if hasattr(tc, 'function') else {}
-                tcs.append({'function': {
-                    'name':      getattr(fn, 'name', ''),
-                    'arguments': getattr(fn, 'arguments', {}),
-                }})
-        m['tool_calls'] = tcs
-    return m
-
 def save_session(messages, name=None):
     if not name:
         name = datetime.now().strftime("%Y%m%d_%H%M%S")
     payload = {
         'saved_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         'model':    MODEL,
-        'messages': [_serialize_msg(m) for m in messages[1:]],
+        'persona':  ACTIVE_PERSONA,
+        'messages': [loki_persist._serialize_msg(m) for m in messages[1:]],
     }
     path = _session_path(name)
     with open(path, 'w') as f:
@@ -1069,7 +1216,51 @@ def parse_slash(text, messages=None):
     if cmd in ('/clear', '/reset'):
         return 'clear', None
     if cmd == '/model':
-        print(f"  {c('model:', DIM)} {MODEL}\n")
+        global MODEL
+        if arg.strip():
+            MODEL = arg.strip()
+            print(f"  {c('model switched to:', DIM)} {c(MODEL, ORANGE)}\n")
+        else:
+            print(f"  {c('model:', DIM)} {MODEL}\n")
+        return 'handled', None
+    if cmd == '/persona':
+        global ACTIVE_PERSONA
+        arg = arg.strip().lower()
+        if not arg:
+            print()
+            print(f"  {c('PERSONAS', BOLD)}")
+            for name, desc in PERSONAS.items():
+                marker = c('►', ORANGE) if name == ACTIVE_PERSONA else ' '
+                first_sentence = desc.split('.')[0] + '.'
+                print(f"    {marker} {c(name, BOLD if name == ACTIVE_PERSONA else GRAY):<18} {c(first_sentence[:60], DIM)}")
+            print(f"\n  {c('current:', DIM)} {ACTIVE_PERSONA}")
+            print(f"  {c('switch:', DIM)} /persona <name>\n")
+        elif arg in PERSONAS:
+            ACTIVE_PERSONA = arg
+            if messages and messages[0]['role'] == 'system':
+                messages[0]['content'] = build_system_prompt()
+            print(f"  {c('persona:', DIM)} {c(ACTIVE_PERSONA, ORANGE)}\n")
+        else:
+            opts = ', '.join(PERSONAS.keys())
+            print(c(f"  unknown persona: {arg}. Available: {opts}\n", RED))
+        return 'handled', None
+    if cmd == '/tools':
+        print()
+        print(f"  {c('AVAILABLE TOOLS', BOLD)}")
+        for tool in tools_schema:
+            fn = tool['function']
+            name = fn['name']
+            desc = fn['description'].split('.')[0]
+            props = fn['parameters']['properties']
+            required = fn['parameters'].get('required', [])
+            print(f"\n    {c(name, ORANGE)}")
+            print(f"      {c(desc, GRAY)}")
+            for pname, pdef in props.items():
+                req_mark = '*' if pname in required else ' '
+                ptype = pdef.get('type', '?')
+                pdesc = pdef.get('description', '')[:60]
+                print(f"      {c(req_mark + pname, CYAN):<18} {c(ptype, DIM):<10} {c(pdesc, GRAY)}")
+        print()
         return 'handled', None
     if cmd == '/cwd':
         print(f"  {c('cwd:', DIM)} {os.getcwd()}\n")
@@ -1201,6 +1392,38 @@ def parse_slash(text, messages=None):
             import shutil
             shutil.copy2(src_path, dst_path)
             print(f"  {c('cloned:', DIM)} {c(src_arg, GRAY)} {c('→', DGRAY)} {c(dst_name, ORANGE)}\n")
+        return 'handled', None
+    if cmd == '/search':
+        term = arg.strip().lower()
+        if not term:
+            print(c("  usage: /search <keyword>\n", GRAY))
+            return 'handled', None
+        matches = []
+        if os.path.isdir(SESSIONS_DIR):
+            for fname in sorted(os.listdir(SESSIONS_DIR), reverse=True):
+                if not fname.endswith('.json'):
+                    continue
+                fpath = os.path.join(SESSIONS_DIR, fname)
+                try:
+                    with open(fpath) as sf:
+                        data = json.load(sf)
+                    found_in = None
+                    for m in data.get('messages', []):
+                        if term in (m.get('content') or '').lower():
+                            found_in = (m.get('content') or '')[:100].replace('\n', ' ')
+                            break
+                    if found_in is not None:
+                        matches.append((fname[:-5], data.get('saved_at', '?'), found_in))
+                except Exception:
+                    pass
+        if not matches:
+            print(c(f"\n  no sessions found for: {arg}\n", DIM))
+        else:
+            print(f"\n  {c('SEARCH RESULTS', BOLD)} for {c(arg, ORANGE)}  {c(f'{len(matches)} found', GRAY)}")
+            for name, saved, snippet in matches:
+                print(f"\n    {c(name, BOLD)}  {c(saved, DIM)}")
+                print(f"    {c(snippet[:80], DGRAY)}")
+            print(f"\n  {c('load one:', DIM)} {c('/resume <name>', ORANGE)}\n")
         return 'handled', None
     if cmd == '/img':
         path = os.path.expanduser(arg.strip().strip('"\''))
@@ -1531,11 +1754,32 @@ def _run_turn(state):
             consecutive_continues = 0
             for tc in msg['tool_calls']:
                 fn = tc.get('function', {})
-                if fn.get('name') == 'run_shell':
-                    args = fn.get('arguments', {})
+                tool_name = fn.get('name', '')
+                args = fn.get('arguments', {}) or {}
+                if tool_name == 'run_shell':
                     cmd_arg = args.get('command', '') if isinstance(args, dict) else ''
                     output = run_shell(cmd_arg)
-                    messages.append({"role": "tool", "content": output})
+                elif tool_name == 'read_file':
+                    if isinstance(args, dict):
+                        output = run_read_file(
+                            args.get('path', ''),
+                            args.get('start_line'),
+                            args.get('end_line'),
+                        )
+                    else:
+                        output = run_read_file(str(args))
+                elif tool_name == 'write_file':
+                    if isinstance(args, dict):
+                        output = run_write_file(
+                            args.get('path', ''),
+                            args.get('content', ''),
+                            bool(args.get('append', False)),
+                        )
+                    else:
+                        output = f"ERROR: malformed write_file arguments: {args}"
+                else:
+                    output = f"ERROR: unknown tool: {tool_name}"
+                messages.append({"role": "tool", "content": output})
             continue
         elif msg.get('done_reason') == 'length' and stats['auto_continue']:
             consecutive_continues += 1
@@ -2220,6 +2464,21 @@ async def async_chat_loop_fullscreen():
 
 
 if __name__ == "__main__":
+    # Load user config (~/.loki.conf) before anything else.
+    _cfg = load_config()
+    if _cfg.get('model') and not os.environ.get('LOKI_MODEL'):
+        MODEL = _cfg['model']
+    if _cfg.get('persona') and _cfg['persona'] in PERSONAS:
+        ACTIVE_PERSONA = _cfg['persona']
+    if 'auto_approve' in _cfg:
+        stats['auto_approve'] = _cfg['auto_approve']
+    if 'auto_continue' in _cfg:
+        stats['auto_continue'] = _cfg['auto_continue']
+    if 'show_thinking' in _cfg:
+        stats['show_thinking'] = _cfg['show_thinking']
+    if _cfg.get('shell_timeout'):
+        SHELL_TIMEOUT = _cfg['shell_timeout']
+
     detect_max_ctx()
     # HW probe + choice of the initial working_ctx: we start small (default 8-16k)
     # instead of allocating KV cache for the whole MAX_CTX. If needed, _run_turn

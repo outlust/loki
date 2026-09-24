@@ -51,6 +51,9 @@ OUTPUT_MAX_CHARS  = 6000
 KEEP_RECENT_MSG   = 6
 MEMORY_MAX_SUMMARIES = 5
 SHELL_TIMEOUT     = 30
+# Memory efficiency: trim old messages every turn (no LLM needed)
+TOOL_OUTPUT_KEEP_CHARS = 400   # chars kept in old tool outputs (head + tail)
+MAX_MESSAGES_BEFORE_COMPRESS = 60  # force compress when history grows this long
 CONFIG_FILE = os.path.expanduser("~/.loki.conf")
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
@@ -164,6 +167,7 @@ SLASH_COMMANDS = {
     '/delete':   'delete a saved session [name|number]',
     '/clone':    'clone a saved session   [source] [new_name]',
     '/hw':       'show detected HW (RAM, threads, GPU, working ctx)',
+    '/trim':     'free memory now: strip thinking + truncate old tool outputs (no LLM)',
     '/exit':     'exit the shell agent',
     '/quit':     'alias of /exit',
 }
@@ -1221,6 +1225,40 @@ def estimate_context_tokens(messages):
     return chars // 4
 
 
+def _trim_old_messages(messages):
+    """Free memory every turn without calling the LLM.
+
+    For messages older than KEEP_RECENT_MSG:
+    - Strips thinking blocks (they are never needed after the turn ends)
+    - Truncates tool outputs to TOOL_OUTPUT_KEEP_CHARS (head + tail)
+
+    Returns a new list; the original is not mutated.
+    """
+    if len(messages) <= KEEP_RECENT_MSG + 1:
+        return messages
+    cutoff = max(1, len(messages) - KEEP_RECENT_MSG)
+    result = list(messages)
+    for i in range(1, cutoff):
+        m = result[i]
+        changed = False
+        # Drop thinking — useless after the turn
+        if m.get('thinking'):
+            m = {k: v for k, v in m.items() if k != 'thinking'}
+            changed = True
+        # Truncate large tool outputs
+        if m.get('role') == 'tool':
+            content = m.get('content', '')
+            if len(content) > TOOL_OUTPUT_KEEP_CHARS:
+                head = content[:TOOL_OUTPUT_KEEP_CHARS // 2]
+                tail = content[-(TOOL_OUTPUT_KEEP_CHARS // 4):]
+                omitted = len(content) - TOOL_OUTPUT_KEEP_CHARS // 2 - TOOL_OUTPUT_KEEP_CHARS // 4
+                m = {**m, 'content': f"{head}\n[...{omitted} chars trimmed...]\n{tail}"}
+                changed = True
+        if changed:
+            result[i] = m
+    return result
+
+
 def compress_context(messages):
     if len(messages) <= 3:
         print(c("  conversazione troppo corta da comprimere\n", DIM))
@@ -1543,6 +1581,17 @@ def parse_slash(text, messages=None):
     if cmd == '/compress':
         if messages:
             return 'compress', messages
+        return 'handled', None
+    if cmd == '/trim':
+        if messages:
+            before = estimate_context_tokens(messages)
+            trimmed = _trim_old_messages(messages)
+            after = estimate_context_tokens(trimmed)
+            saved = max(0, before - after)
+            msg_count = len([m for m in messages if m.get('role') == 'tool'])
+            print(f"  {c('✓ trim done', GREEN)}  {c(f'~{saved} tokens freed', GRAY)}  "
+                  f"{c(f'{msg_count} tool msgs processed', DIM)}\n")
+            return 'trim', trimmed
         return 'handled', None
     if cmd == '/think':
         stats['show_thinking'] = not stats['show_thinking']
@@ -1990,10 +2039,20 @@ def _run_turn(state):
     """
     messages = state['messages']
 
+    # Dynamic COMPRESS_PREEMPT: lower the threshold as the session ages.
+    # After 1h → 0.55, after 2h → 0.45. Prevents late-session lag buildup.
+    _session_age_h = (datetime.now() - stats['start_time']).total_seconds() / 3600
+    if _session_age_h >= 2:
+        _eff_preempt = 0.45
+    elif _session_age_h >= 1:
+        _eff_preempt = 0.55
+    else:
+        _eff_preempt = COMPRESS_PREEMPT
+
     # Compressione pre-emptiva: intervieni PRIMA di inviare se il contesto stimato
-    # supera COMPRESS_PREEMPT del working_ctx, invece di aspettare done_reason=length.
+    # supera _eff_preempt del working_ctx, invece di aspettare done_reason=length.
     est = estimate_context_tokens(messages)
-    if est >= int(stats['working_ctx'] * COMPRESS_PREEMPT):
+    if est >= int(stats['working_ctx'] * _eff_preempt):
         new_ctx = loki_hw.next_working_ctx(stats['working_ctx'], MAX_CTX)
         if new_ctx > stats['working_ctx']:
             old = stats['working_ctx']
@@ -2160,6 +2219,19 @@ def _run_turn(state):
                     messages = state['messages']
             break
 
+    # Lightweight memory cleanup every turn: strip thinking + truncate old
+    # tool outputs. Free, no LLM call. Keeps RAM lean during long sessions.
+    state['messages'] = _trim_old_messages(state['messages'])
+    messages = state['messages']
+
+    # Message-count hard cap: if history grew too long, force an LLM compress
+    # even if context % hasn't hit the threshold yet. Prevents lag after hours.
+    non_sys = [m for m in messages if m.get('role') != 'system']
+    if len(non_sys) > MAX_MESSAGES_BEFORE_COMPRESS:
+        print(f"\n  {c(f'⚠ {len(non_sys)} messaggi in history — comprimo automaticamente...', YELLOW)}")
+        state['messages'] = compress_context(messages)
+        messages = state['messages']
+
     # Autosave dopo ogni turno completato (o interrotto): l'utente non deve
     # perdere una sessione lunga per un crash del terminale o di Ollama.
     try:
@@ -2186,6 +2258,9 @@ def _handle_slash(text, state):
         return False
     if action == 'compress':
         state['messages'] = compress_context(state['messages'])
+        return False
+    if action == 'trim':
+        state['messages'] = payload
         return False
     if action == 'picker':
         _picker_activate(state)

@@ -1,22 +1,22 @@
-"""Hardware detection and adaptive num_ctx policy for Loki.
+"""Rilevamento hardware e politica di num_ctx adattiva per Loki.
 
-No UI dependency: pure functions that return data.
-Core idea: Ollama's KV cache scales linearly with num_ctx. Keeping it
-low is the biggest RAM win. We start small and grow by tiers only when
-the prompt actually needs it.
+Nessuna dipendenza dall'UI: funzioni pure che ritornano dati.
+L'idea centrale: il KV cache di Ollama scala con num_ctx. Tenerlo basso
+e' la vittoria piu' grossa in termini di RAM. Partiamo piccolo e
+cresciamo per tier solo quando il prompt lo richiede davvero.
 """
 import os
 import subprocess
 
 
-# num_ctx tiers: geometric growth, clean jumps.
+# Tier di num_ctx: crescita geometrica, salti franchi.
 CTX_TIERS = [4096, 8192, 16384, 32768, 65536, 131072]
 
 
 def detect_hardware():
-    """Return a dict with RAM/threads/GPU. Called once at boot.
+    """Ritorna un dict con RAM/thread/GPU. Chiamata una volta al boot.
 
-    gpu_kind is one of: 'nvidia', 'amd_rocm', 'amd_no_rocm', 'none'.
+    gpu_kind e' uno di: 'nvidia', 'amd_rocm', 'amd_no_rocm', 'none'.
     """
     info = {
         'ram_total_gb': 0.0,
@@ -43,7 +43,7 @@ def detect_hardware():
             return info
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
-    # AMD with ROCm active
+    # AMD con ROCm attivo
     try:
         r = subprocess.run(['rocm-smi'],
                            capture_output=True, timeout=1)
@@ -52,7 +52,7 @@ def detect_hardware():
             return info
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
-    # AMD present but ROCm not active -> Ollama will run on CPU
+    # AMD presente ma ROCm non attivo -> Ollama girera' su CPU
     try:
         r = subprocess.run(['lspci'],
                            capture_output=True, text=True, timeout=1)
@@ -66,11 +66,12 @@ def detect_hardware():
 
 
 def initial_working_ctx(model_max_ctx, ram_avail_gb, model_size_gb_hint=8.0):
-    """Pick a starting num_ctx so the KV cache does not eat all the RAM.
+    """Sceglie il ctx di partenza in modo che il KV cache non mangi la RAM.
 
-    Rough rule: after reserving RAM for the model itself, allow the KV
-    cache at most ~25% of what's left. With Ollama's q8_0 KV we estimate
-    ~2 KB per token (varies by model, but this ceiling is conservative).
+    Regola grezza: dopo aver messo da parte la RAM per il modello,
+    lascia al KV cache al massimo ~25% del residuo. Con Ollama q8_0 KV
+    si stimano ~2 KB per token (varia col modello, ma questo tetto e'
+    conservativo).
     """
     residual_gb = max(0.5, ram_avail_gb - model_size_gb_hint)
     budget_gb = residual_gb * 0.25
@@ -80,25 +81,25 @@ def initial_working_ctx(model_max_ctx, ram_avail_gb, model_size_gb_hint=8.0):
     for t in CTX_TIERS:
         if t <= cap and t <= model_max_ctx:
             picked = t
-    # Sensible default: if the cap were huge, start at 16k, not 128k.
+    # Default ragionevole: se il cap fosse enorme, parti a 16k, non a 128k.
     return min(picked, 16384, model_max_ctx)
 
 
 def next_working_ctx(current, model_max_ctx):
-    """Return the next tier (used when the prompt approaches the ceiling)."""
+    """Tier successivo (usato quando il prompt si avvicina al ceiling)."""
     for t in CTX_TIERS:
         if t > current and t <= model_max_ctx:
             return t
-    return current  # already at the ceiling
+    return current  # gia' al tetto
 
 
 def hw_line(hw, working_ctx, model_max_ctx):
-    """Compact status line (used at boot and by /hw)."""
+    """Riga di stato compatta (usata a boot e per /hw)."""
     ram = f"{hw['ram_avail_gb']:.1f}/{hw['ram_total_gb']:.1f} GB"
     gpu_label = {
-        'nvidia':      'NVIDIA GPU',
-        'amd_rocm':    'AMD GPU (ROCm)',
-        'amd_no_rocm': 'AMD GPU (no ROCm -> CPU)',
+        'nvidia':      'GPU NVIDIA',
+        'amd_rocm':    'GPU AMD (ROCm)',
+        'amd_no_rocm': 'GPU AMD (no ROCm -> CPU)',
         'none':        'CPU only',
     }[hw['gpu_kind']]
     return (f"HW: RAM {ram}  {hw['threads']} thr  {gpu_label}  "

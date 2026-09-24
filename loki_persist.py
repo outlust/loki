@@ -1,9 +1,10 @@
-"""Session persistence for Loki: per-turn autosave + resume-last + prune.
+"""Persistenza sessioni per Loki: autosave per turno + resume-last + prune.
 
-Zero UI dependency. Each function takes paths/dicts and returns data.
-The point: no long session should be lost if the terminal dies or Ollama
-crashes. Every turn is atomically serialized to `_autosave.json` (tmp +
-rename, so a mid-write crash never leaves a corrupted file behind).
+Zero dipendenze dall'UI. Ogni funzione prende paths/dict e ritorna dati.
+Il senso: nessuna sessione lunga deve andare persa se il terminale muore
+o se ollama va giu'. Ogni turno viene serializzato atomicamente su
+`_autosave.json` (tmp + rename, cosi' un crash a meta' scrittura non
+lascia un file corrotto).
 """
 import json
 import os
@@ -17,8 +18,8 @@ SESSION_MAX_AGE_DAYS = 60
 
 
 def _serialize_msg(msg):
-    """Serializable copy of a message: normalizes tool_calls (which can be
-    pydantic-like objects returned by ollama, not just dicts)."""
+    """Copia serializzabile di un messaggio: normalizza tool_calls (che possono
+    essere oggetti pydantic-like ritornati da ollama, non solo dict)."""
     m = dict(msg)
     if 'tool_calls' in m and m['tool_calls']:
         tcs = []
@@ -36,9 +37,9 @@ def _serialize_msg(msg):
 
 
 def autosave_session(messages, model, sessions_dir, name=AUTOSAVE_NAME):
-    """Atomically write the autosave. Skip if only the system prompt is present.
+    """Scrive atomicamente l'autosave. Salta se solo system prompt.
 
-    Returns the written path (or None if skipped/error).
+    Ritorna il path scritto (o None se saltato/errore).
     """
     if not messages or len(messages) <= 1:
         return None
@@ -59,7 +60,7 @@ def autosave_session(messages, model, sessions_dir, name=AUTOSAVE_NAME):
         return path
     except Exception:
         try:
-            os.unlink(tmp_path)  # noqa: F821 (only defined if mkstemp succeeded)
+            os.unlink(tmp_path)  # noqa: F821 (definito solo se mkstemp e' passato)
         except Exception:
             pass
         return None
@@ -67,7 +68,7 @@ def autosave_session(messages, model, sessions_dir, name=AUTOSAVE_NAME):
 
 def load_autosave_if_fresh(sessions_dir, name=AUTOSAVE_NAME,
                            ttl_hours=AUTOSAVE_TTL_HOURS):
-    """Return the autosave payload if it exists and is recent, else None."""
+    """Ritorna il payload dell'autosave se esiste ed e' recente, altrimenti None."""
     path = os.path.join(sessions_dir, f"{name}.json")
     if not os.path.isfile(path):
         return None
@@ -82,7 +83,7 @@ def load_autosave_if_fresh(sessions_dir, name=AUTOSAVE_NAME,
 
 
 def autosave_age_seconds(sessions_dir, name=AUTOSAVE_NAME):
-    """Age of the autosave in seconds, or None if not present."""
+    """Eta' dell'autosave in secondi, o None se non esiste."""
     path = os.path.join(sessions_dir, f"{name}.json")
     if not os.path.isfile(path):
         return None
@@ -94,10 +95,10 @@ def autosave_age_seconds(sessions_dir, name=AUTOSAVE_NAME):
 
 def prune_old_sessions(sessions_dir, max_age_days=SESSION_MAX_AGE_DAYS,
                        skip_prefixes=('_',)):
-    """Remove .json session files older than max_age_days.
+    """Rimuove file di sessione .json piu' vecchi di max_age_days.
 
-    Files whose names start with any of `skip_prefixes` (default: '_' ->
-    autosave) are never touched. Returns the list of removed names.
+    File con nome che inizia per skip_prefixes (default: '_' -> autosave)
+    non vengono mai toccati. Ritorna la lista di nomi rimossi.
     """
     if not os.path.isdir(sessions_dir):
         return []

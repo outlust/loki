@@ -34,66 +34,70 @@ VERSION = "0.6.0"
 PREVIEW_LINES = 20
 SESSIONS_DIR  = os.path.expanduser("~/.loki_sessions")
 MEMORY_FILE   = os.path.expanduser("~/.loki_memory.md")
-COMPRESS_AT   = 0.80   # compress at 80% of the context
-MAX_CTX       = 32768  # model's real ceiling (detected at boot via ollama.show)
-WORKING_CTX   = 8192   # ctx actually passed to Ollama (adaptive, live in stats)
-KEEP_ALIVE    = '15m'  # keeps the model loaded in RAM between turns
-COMPRESS_CTX  = 8192   # smaller num_ctx dedicated to the compression call
-OUTPUT_MAX_LINES  = 100  # rows above which we truncate the output sent to the model
-OUTPUT_HEAD_LINES = 40   # first rows to keep
-OUTPUT_TAIL_LINES = 30   # last rows to keep
-KEEP_RECENT_MSG   = 6    # recent messages preserved after compress (rounded at turn start)
-MEMORY_MAX_SUMMARIES = 5  # how many session summaries to keep in the memory file
+WORKSPACE_DIR  = os.path.expanduser("~/.loki_workspace")
+WORKSPACE_FILES = {"plan.md", "failures.md", "ideas.md", "notes.md", "scratch.md"}
+COMPRESS_AT      = 0.80   # comprimi all'80% del context
+COMPRESS_PREEMPT = 0.65   # soglia pre-emptiva: comprimi/cresci PRIMA di inviare la richiesta
+MAX_CTX       = 32768  # tetto reale del modello (rilevato al boot da ollama.show)
+WORKING_CTX   = 8192   # ctx effettivamente passato a Ollama (adattivo, live in stats)
+KEEP_ALIVE    = '15m'  # tiene il modello caricato in RAM tra i turni
+COMPRESS_CTX  = 8192   # num_ctx piu piccolo dedicato alla chiamata di compressione
+OUTPUT_MAX_LINES  = 100   # righe oltre le quali tronchiamo l'output mandato al modello
+OUTPUT_HEAD_LINES = 40    # prime righe da mantenere
+OUTPUT_TAIL_LINES = 30    # ultime righe da mantenere
+OUTPUT_MAX_CHARS  = 6000  # hard cap in caratteri (cattura righe-monstre: JSON, base64, log su una riga)
+KEEP_RECENT_MSG   = 6    # messaggi recenti da preservare dopo compress (arrotondato a inizio turno)
+MEMORY_MAX_SUMMARIES = 5  # quanti riassunti di sessione tenere nel file di memoria
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
-# Helper modules (pure logic, no UI):
-#   loki_hw      -> hardware probe + adaptive num_ctx policy
-#   loki_persist -> per-turn autosave + resume-last + prune old
-#   loki_mem     -> capped memory file with rotation
+# Moduli helper (logica pura, niente UI):
+#   loki_hw      -> probe hardware + policy num_ctx adattiva
+#   loki_persist -> autosave per turno + resume-last + prune vecchi
+#   loki_mem     -> memoria capata con rotazione
 import loki_hw
 import loki_persist
 import loki_mem
 
-HW = None  # dict populated at boot by loki_hw.detect_hardware()
+HW = None  # dict popolato al boot da loki_hw.detect_hardware()
 
 R      = "\033[0m"
 DIM    = "\033[2m"
 BOLD   = "\033[1m"
-ORANGE = "\033[38;5;135m"   # medium purple (main accent)
-GREEN  = "\033[38;5;93m"    # dark purple  (ok/secondary states)
+ORANGE = "\033[38;5;135m"   # viola medio  (ex arancio - accento principale)
+GREEN  = "\033[38;5;93m"    # viola scuro  (ex verde   - stati ok/secondario)
 RED    = "\033[38;5;196m"
 BLUE   = "\033[38;5;39m"
 GRAY   = "\033[38;5;244m"
 DGRAY  = "\033[38;5;238m"
 CYAN   = "\033[38;5;51m"
 YELLOW = "\033[38;5;220m"
-PURPLE = "\033[38;5;141m"   # lavender (thinking block)
+PURPLE = "\033[38;5;141m"   # lavanda     (thinking block)
 
 SLASH_COMMANDS = {
-    '/help':    'show available commands',
-    '/clear':   'clear the conversation',
-    '/reset':   'alias of /clear',
-    '/model':   'show the model in use',
-    '/cwd':     'show current directory',
-    '/img':     'attach an image to the next message',
-    '/auto':    'enable auto-approve for commands',
-    '/manual':  'disable auto-approve for commands',
-    '/ac':        'toggle auto-continue when tokens run out',
-    '/remember':  'save something to persistent memory',
-    '/memory':    'show persistent memory',
-    '/compress':  'summarize the conversation and save to memory',
-    '/think':   'show/hide the model reasoning',
-    '/last':    'reprint the last full output',
-    '/history': 'session statistics',
-    '/cost':    'alias of /history',
-    '/save':     'save the current session  [name]',
-    '/resume':   'list/resume a saved session (no arg: list; /resume <n|name>: load and reprint history)',
-    '/resume-last': "resume the last session's autosave (if < 12h old)",
-    '/delete':   'delete a saved session [name|number]',
-    '/clone':    'clone a saved session   [source] [new_name]',
-    '/hw':       'show detected HW (RAM, threads, GPU, working ctx)',
-    '/exit':     'exit the shell agent',
-    '/quit':     'alias of /exit',
+    '/help':    'mostra i comandi disponibili',
+    '/clear':   'pulisce la conversazione',
+    '/reset':   'alias di /clear',
+    '/model':   'mostra il modello in uso',
+    '/cwd':     'mostra directory corrente',
+    '/img':     'allega immagine al prossimo messaggio',
+    '/auto':    'attiva approvazione automatica comandi',
+    '/manual':  'disattiva approvazione automatica comandi',
+    '/ac':        'attiva/disattiva auto-continue quando finiscono i token',
+    '/remember':  'salva qualcosa nella memoria persistente',
+    '/memory':    'mostra la memoria persistente',
+    '/compress':  'riassume la conversazione e salva in memoria',
+    '/think':   'mostra/nasconde il ragionamento del modello',
+    '/last':    'ristampa ultimo output completo',
+    '/history': 'statistiche della sessione',
+    '/cost':    'alias di /history',
+    '/save':     'salva la sessione corrente  [nome]',
+    '/resume':   'elenca/riprendi una sessione salvata (senza arg: elenca; /resume <n|nome>: carica e ristampa la storia)',
+    '/resume-last': "riprendi l'autosave dell'ultima sessione (se < 12h)",
+    '/delete':   'elimina una sessione salvata [nome|numero]',
+    '/clone':    'clona una sessione salvata   [sorgente] [nuovo_nome]',
+    '/hw':       'mostra HW rilevato (RAM, thread, GPU, working ctx)',
+    '/exit':     'esci dallo shell agent',
+    '/quit':     'alias di /exit',
 }
 
 stats = {
@@ -104,28 +108,106 @@ stats = {
     'auto_approve':   True,
     'show_thinking':  True,
     'auto_continue':  True,
-    'last_tokens':    0,   # tokens GENERATED in the last response (eval_count)
-    'ctx_used':       0,   # tokens in the PROMPT of the last call (prompt_eval_count) — the context-fill signal
-    'working_ctx':    WORKING_CTX,  # ctx actually allocated by Ollama (adaptive)
+    'last_tokens':    0,   # token GENERATI nell'ultima risposta (eval_count)
+    'ctx_used':       0,   # token del PROMPT dell'ultima chiamata (prompt_eval_count) — questo e il segnale di riempimento contesto
+    'working_ctx':    WORKING_CTX,  # ctx effettivamente allocato lato Ollama (adattivo)
     'pending_images': [],
     'last_command':   None,
     'last_output':    None,
 }
 
-tools_schema = [{
-    "type": "function",
-    "function": {
-        "name": "run_shell",
-        "description": "Run a bash command on Linux and return stdout+stderr",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "command": {"type": "string", "description": "Bash command to run"}
-            },
-            "required": ["command"]
+tools_schema = [
+    {
+        "type": "function",
+        "function": {
+            "name": "run_shell",
+            "description": (
+                "Esegue un comando bash su Linux e restituisce stdout+stderr. "
+                "REGOLA CRITICA: se sai gia' il comando, chiamalo ORA senza altro reasoning. "
+                "Hai coordinate per xdotool? `xdotool click X Y` ORA. "
+                "Devi verificare DISPLAY, un path, un PID? grep/cat/ls ORA. "
+                "Hai considerato 2+ alternative? Scegli la piu' probabile, eseguila ORA. "
+                "L'output reale di un comando fallito vale piu' di qualsiasi ragionamento."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Comando bash da eseguire"}
+                },
+                "required": ["command"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": (
+                "Cerca informazioni online (sintassi di tool, documentazione, CVE, workaround). "
+                "Usalo PRIMA di provare a indovinare opzioni o flag sconosciuti, e quando un comando "
+                "fallisce per motivi non chiari. Restituisce snippet di testo rilevanti."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Stringa di ricerca in inglese o italiano"}
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "workspace_write",
+            "description": (
+                "Scrivi o aggiorna un file nella workspace persistente. "
+                "Usa INVECE di ragionare in loop: se stai considerando piu' di 2 opzioni "
+                "o hai fatto un passo fallito, scrivilo su file ORA. "
+                "I file sopravvivono tra i turni — il tuo thinking no. "
+                "plan.md=piano corrente, failures.md=cosa non ha funzionato, "
+                "ideas.md=opzioni considerate, notes.md=note libere, scratch.md=bozze."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file": {
+                        "type": "string",
+                        "description": "Nome file: plan.md | failures.md | ideas.md | notes.md | scratch.md"
+                    },
+                    "content": {"type": "string", "description": "Contenuto da scrivere"},
+                    "mode": {
+                        "type": "string",
+                        "description": "write=sovrascrivi, append=aggiungi in fondo",
+                        "enum": ["write", "append"]
+                    }
+                },
+                "required": ["file", "content", "mode"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "workspace_read",
+            "description": (
+                "Leggi un file dalla workspace. "
+                "Chiamalo all'inizio di sessioni complesse per ricordare dove eri. "
+                "Leggi failures.md prima di riprovare qualcosa che potrebbe gia' aver fallito."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file": {
+                        "type": "string",
+                        "description": "Nome file: plan.md | failures.md | ideas.md | notes.md | scratch.md"
+                    }
+                },
+                "required": ["file"]
+            }
         }
     }
-}]
+]
 
 class SlashOnlyCompleter(Completer):
     def get_completions(self, document, complete_event):
@@ -147,42 +229,42 @@ def strip_ansi(s):
 def c(text, color):
     return f"{color}{text}{R}"
 
-# Global flag set by async_chat_loop: True when we are inside the
-# prompt_toolkit Application. get_app_or_none() does not work from an
-# executor thread (ContextVar does not propagate), so we use an explicit flag.
+# Flag globale settato da async_chat_loop: True quando siamo dentro la
+# Application prompt_toolkit. get_app_or_none() non funziona da executor thread
+# (ContextVar non si propaga), quindi usiamo un flag esplicito.
 _PINNED_MODE = False
 
-# Event set by the Ctrl+C handler to interrupt the current streaming/turn.
-# stream_response checks it between chunks and raises KeyboardInterrupt
-# when set, so it reuses the existing interruption handler.
+# Event settato dall'handler Ctrl+C per interrompere lo streaming/turno corrente.
+# stream_response lo controlla tra un chunk e l'altro e alza KeyboardInterrupt
+# quando e set, cosi riusa il gia esistente handler di interruzione.
 _cancel_event = threading.Event()
 
-# Event True when the model is emitting tool_calls (bash) or when
-# run_shell is executing a command: the spinner shows "bashing..." instead
-# of "cooking...". Set/cleared in stream_response and run_shell.
+# Event True quando il modello sta emettendo tool_calls (bash) o quando
+# run_shell sta eseguendo un comando: lo spinner mostra "bashing..." invece
+# di "cooking...". Set/clear in stream_response e run_shell.
 _bashing_event = threading.Event()
 
 # ==================== FULLSCREEN v2 =====================
-# Shared accumulator for all text going into the output area.
+# Accumulatore condiviso di tutto il testo che va nell'output area.
 _output_chunks   = []
 _output_lock     = threading.Lock()
 _app_ref         = None
-_follow_bottom   = [True]   # True = stick to bottom (default); False = user scrolled up
-_scroll_lines    = [0]      # when NOT following: N lines from the top of content
-_last_max_scroll = [0]      # last scrollable amount seen at render (for capping/sync)
-_desired_scroll  = [0]      # desired position (updated immediately at each scroll, for virtual cursor)
-_output_line_count  = [1]   # number of lines from the last _get_output_ft() — for _get_output_cursor_pos
-_output_window_ref  = [None]  # reference to the output Window — to read render_info
+_follow_bottom   = [True]   # True = incolla al fondo (default); False = utente ha rotellato su
+_scroll_lines    = [0]      # quando NON segue: N righe dall'alto del contenuto
+_last_max_scroll = [0]      # ultima quantita scrollabile vista al render (per capping/sync)
+_desired_scroll  = [0]      # posizione voluta (aggiornata subito a ogni scroll, per cursore-virtuale)
+_output_line_count  = [1]   # numero righe dell'ultimo _get_output_ft() — per _get_output_cursor_pos
+_output_window_ref  = [None]  # riferimento al Window dell'output — per leggere render_info
 _mouse_enabled   = [True]
-# Session picker state (activated by /resume with no arguments)
+# Stato picker sessioni (attivato da /resume senza argomenti)
 _picker = dict(active=False, sessions=[], cursor=0,
                mode='list', action=0, clone_buf='')
-_picker_state_ref = [None]   # reference to state dict for loading the chosen session
+_picker_state_ref = [None]   # riferimento a state dict per caricare la sessione scelta
 
 
 def _debug_log(msg):
-    """Log to ~/loki_debug.log. Useful for errors otherwise invisible in
-    fullscreen (where stdout goes to void or into the output area)."""
+    """Log a ~/loki_debug.log. Utile per errori altrimenti invisibili in
+    fullscreen (dove stdout va nel void o nell'output area)."""
     try:
         with open(os.path.expanduser("~/loki_debug.log"), "a") as f:
             f.write(f"[{datetime.now().isoformat(timespec='seconds')}] {msg}\n")
@@ -191,8 +273,8 @@ def _debug_log(msg):
 
 
 def _output_append(text):
-    """Accumulate text into the output area. Handles '\\r' (return to start
-    of current line and overwrite) so progress bars and the like work."""
+    """Accumula testo nell'output area. Gestisce '\\r' (torna a inizio riga
+    corrente e sovrascrive) per far funzionare barre di progresso e simili."""
     with _output_lock:
         if '\r' not in text:
             _output_chunks.append(text)
@@ -213,7 +295,7 @@ def _output_append(text):
 
 
 class _OutputProxy:
-    """File-like that intercepts sys.stdout and feeds the output area."""
+    """File-like che intercetta sys.stdout e alimenta l'output area."""
     def write(self, text):
         if isinstance(text, bytes):
             text = text.decode('utf-8', errors='replace')
@@ -234,12 +316,12 @@ class _OutputProxy:
 
 
 def _scroll_up(step):
-    """Scroll up by N lines. The first scroll-up exits 'follow-bottom' mode
-    and pins the manual position to the current value (known max_scroll)."""
+    """Scrolla su di N righe. Al primo scroll-up esce dal 'segui-fondo' e
+    fissa la posizione manuale al valore attuale (max_scroll conosciuto)."""
     if _follow_bottom[0]:
         _follow_bottom[0] = False
-        # If _last_max_scroll is not yet updated (first render did not
-        # happen yet), fall back to logical line count as a reasonable value.
+        # Se _last_max_scroll non e ancora aggiornato (primo render non ancora
+        # avvenuto), usa il conteggio righe logiche come fallback ragionevole.
         _scroll_lines[0] = _last_max_scroll[0] if _last_max_scroll[0] > 0 else max(0, _output_line_count[0] - 1)
     _scroll_lines[0] = max(0, _scroll_lines[0] - step)
     _desired_scroll[0] = _scroll_lines[0]
@@ -248,17 +330,17 @@ def _scroll_up(step):
 
 
 def _scroll_down(step):
-    """Scroll down by N lines. If you return to the bottom (or past it)
-    'follow-bottom' mode is re-entered so new content shows up on its own."""
+    """Scrolla giu di N righe. Se torni al fondo (o oltre) rientri in
+    'segui-fondo' cosi il contenuto nuovo appare automaticamente."""
     if _follow_bottom[0]:
-        return  # already at the bottom, nothing to do
+        return  # gia al fondo, niente da fare
     _scroll_lines[0] += step
     if _scroll_lines[0] >= _last_max_scroll[0]:
         _follow_bottom[0] = True
         _scroll_lines[0]  = 0
         _desired_scroll[0] = _last_max_scroll[0]
     else:
-        _desired_scroll[0] = _scroll_lines[0]   # update immediately
+        _desired_scroll[0] = _scroll_lines[0]   # aggiorna subito
     if _app_ref is not None:
         _app_ref.invalidate()
 
@@ -272,36 +354,36 @@ def _scroll_to_bottom():
 
 
 def _get_output_cursor_pos() -> Point:
-    """Return the virtual cursor position of the FormattedTextControl.
-    Uses _output_line_count (updated by _get_output_ft() in the same frame)
-    to stay inside the bounds of the rendered content.
-    Also refreshes _last_max_scroll from the previous frame's render_info,
-    so _scroll_up/_scroll_down have a real cap (with wrap_lines=True
-    get_vertical_scroll is never called)."""
+    """Ritorna la posizione del cursore virtuale del FormattedTextControl.
+    Usa _output_line_count (aggiornato da _get_output_ft() nello stesso frame)
+    per stare sempre dentro i bounds del contenuto renderizzato.
+    Aggiorna _last_max_scroll dal render_info del frame precedente, cosi
+    _scroll_up/_scroll_down hanno un cap reale (con wrap_lines=True
+    get_vertical_scroll non viene mai chiamata)."""
     try:
         lc = _output_line_count[0]
-        # Refresh max scroll by reading the previous frame's render_info.
-        # visible_line_numbers is the list of visible logical lines; its
-        # unique length = how many logical lines fit in the window right now.
+        # Aggiorna il max scroll leggendo render_info del frame precedente.
+        # visible_line_numbers e la lista delle righe logiche visibili; la sua
+        # lunghezza (unica) = quante righe logiche stanno nel window adesso.
         win = _output_window_ref[0]
         if win is not None:
             ri = win.render_info
             if ri is not None and ri.displayed_lines:
-                vis = len(set(ri.displayed_lines))   # unique visible logical lines
+                vis = len(set(ri.displayed_lines))   # righe logiche uniche visibili
                 _last_max_scroll[0] = max(0, lc - vis)
         if _follow_bottom[0]:
             return Point(x=0, y=max(0, lc - 1))
         return Point(x=0, y=min(_desired_scroll[0], max(0, lc - 1)))
     except Exception as e:
         import traceback as _tb
-        _debug_log(f"_get_output_cursor_pos ERROR: {e}\n{_tb.format_exc()}")
+        _debug_log(f"_get_output_cursor_pos ERRORE: {e}\n{_tb.format_exc()}")
         return Point(x=0, y=0)
 
 
 # ── Session Picker ────────────────────────────────────────────────────────────
 
 def _picker_load_sessions():
-    """Load the session list ordered from most recent."""
+    """Carica la lista sessioni ordinata dalla piu recente."""
     out = []
     if not os.path.isdir(SESSIONS_DIR):
         return out
@@ -325,10 +407,10 @@ def _picker_elapsed(saved_at):
     try:
         dt   = datetime.strptime(saved_at, "%Y-%m-%d %H:%M:%S")
         secs = int((datetime.now() - dt).total_seconds())
-        if secs < 60:    return f"{secs}s ago"
-        if secs < 3600:  return f"{secs//60}m ago"
-        if secs < 86400: return f"{secs//3600}h ago"
-        return f"{secs//86400}d ago"
+        if secs < 60:    return f"{secs}s fa"
+        if secs < 3600:  return f"{secs//60}m fa"
+        if secs < 86400: return f"{secs//3600}h fa"
+        return f"{secs//86400}g fa"
     except Exception:
         return ''
 
@@ -352,7 +434,7 @@ def _picker_deactivate():
 
 
 def _picker_render():
-    """Generate the ANSI text for the picker to show in the output area."""
+    """Genera il testo ANSI del picker da mostrare nell'output area."""
     ss  = _picker['sessions']
     cur = _picker['cursor']
     mode= _picker['mode']
@@ -360,12 +442,12 @@ def _picker_render():
     W   = max(50, term_width() - 6)
 
     out = []
-    out.append(f"\n  {BOLD}{ORANGE}SAVED SESSIONS{R}  {DIM}{len(ss)} sessions{R}")
+    out.append(f"\n  {BOLD}{ORANGE}SESSIONI SALVATE{R}  {DIM}{len(ss)} sessioni{R}")
     out.append(f"  {DGRAY}{'─' * (W - 2)}{R}")
 
     if not ss:
-        out.append(f"\n  {DIM}no saved sessions{R}")
-        out.append(f"\n  {GRAY}Esc{R} = close")
+        out.append(f"\n  {DIM}nessuna sessione salvata{R}")
+        out.append(f"\n  {GRAY}Esc{R} = chiudi")
         return '\n'.join(out)
 
     for i, s in enumerate(ss):
@@ -379,33 +461,33 @@ def _picker_render():
         elapsed_str= f"{DIM}{elapsed:<10}{R}"
         msgs_str   = f"{GRAY}{n_msg} msg{R}"
 
-        # Action labels: shown inline only on the selected row
+        # Label azioni: visibili inline solo sulla riga selezionata
         if sel and mode in ('list', 'actions', 'delete_confirm', 'clone_input'):
-            del_lbl = f"{BOLD}{RED}[✕ Delete]{R}" if (mode == 'actions' and act == 0) else f"{DGRAY}[✕ Delete]{R}"
-            cln_lbl = f"{BOLD}{GREEN}[⎘ Clone]{R}" if (mode == 'actions' and act == 1) else f"{DGRAY}[⎘ Clone]{R}"
+            del_lbl = f"{BOLD}{RED}[✕ Elim]{R}" if (mode == 'actions' and act == 0) else f"{DGRAY}[✕ Elim]{R}"
+            cln_lbl = f"{BOLD}{GREEN}[⎘ Clona]{R}" if (mode == 'actions' and act == 1) else f"{DGRAY}[⎘ Clona]{R}"
             emoji_str = f"  {del_lbl}  {cln_lbl}"
         else:
             emoji_str = ""
 
         if sel and mode == 'delete_confirm':
             out.append(f"  {arrow} {name_str:<28}  {elapsed_str}  {msgs_str}{emoji_str}")
-            d = f"{RED if act==0 else DGRAY}[ Yes, delete ]{R}"
-            a = f"{GREEN if act==1 else DGRAY}[ Cancel ]{R}"
-            out.append(f"       {d}  {a}  {DGRAY}(← → choose, Enter to confirm){R}")
+            d = f"{RED if act==0 else DGRAY}[ Sì, elimina ]{R}"
+            a = f"{GREEN if act==1 else DGRAY}[ Annulla ]{R}"
+            out.append(f"       {d}  {a}  {DGRAY}(← → scegli, Invio conferma){R}")
         elif sel and mode == 'clone_input':
             out.append(f"  {arrow} {name_str:<28}  {elapsed_str}  {msgs_str}{emoji_str}")
-            out.append(f"  {DIM}Type the new name in the field below and press Enter{R}  {DGRAY}(Esc = cancel){R}")
+            out.append(f"  {DIM}Scrivi il nuovo nome nel campo qui sotto e premi Invio{R}  {DGRAY}(Esc = annulla){R}")
         else:
             out.append(f"  {arrow} {name_str:<28}  {elapsed_str}  {msgs_str}{emoji_str}")
 
     out.append(f"\n  {DGRAY}{'─' * (W - 2)}{R}")
     if mode in ('list', 'actions'):
-        out.append(f"  {GRAY}↑↓{R} navigate  {GRAY}Enter{R} open  {GRAY}→{R} pick action  {GRAY}Esc{R} exit")
+        out.append(f"  {GRAY}↑↓{R} naviga  {GRAY}Invio{R} apri  {GRAY}→{R} seleziona azione  {GRAY}Esc{R} esci")
     return '\n'.join(out)
 
 
 def _picker_do_load(name):
-    """Load the selected session: closes the picker, calls resume_session."""
+    """Carica la sessione selezionata: chiude il picker, chiama resume_session."""
     state = _picker_state_ref[0]
     if state is None:
         _picker_deactivate()
@@ -418,10 +500,10 @@ def _picker_do_load(name):
     _scroll_to_bottom()
 
 
-# ── End Session Picker ────────────────────────────────────────────────────────
+# ── Fine Session Picker ────────────────────────────────────────────────────────
 
 def _wheel_scroll_output(mouse_event):
-    """Shared handler: wheel up/down → scroll output."""
+    """Handler condiviso: rotella su/giu → scrolla output."""
     et = mouse_event.event_type
     if et == MouseEventType.SCROLL_UP:
         _scroll_up(3)
@@ -433,7 +515,7 @@ def _wheel_scroll_output(mouse_event):
 
 
 class _ScrollableOutputControl(FormattedTextControl):
-    """FormattedTextControl + wheel handler for the output area itself."""
+    """FormattedTextControl + handler rotella per l'output area stesso."""
     def mouse_handler(self, mouse_event):
         res = _wheel_scroll_output(mouse_event)
         if res is NotImplemented:
@@ -442,9 +524,9 @@ class _ScrollableOutputControl(FormattedTextControl):
 
 
 class _WheelFTControl(FormattedTextControl):
-    """'Passive' FormattedTextControl that intercepts wheel events and forwards
-    them to the output area — used for toolbar/separator/spinner so the wheel
-    works even when the cursor is over them."""
+    """FormattedTextControl 'passivo' che intercetta la rotella e la manda
+    all'output area — usato per toolbar/separator/spinner cosi la rotella
+    funziona anche se il cursore e sopra di loro."""
     def mouse_handler(self, mouse_event):
         res = _wheel_scroll_output(mouse_event)
         if res is NotImplemented:
@@ -453,8 +535,8 @@ class _WheelFTControl(FormattedTextControl):
 
 
 class _WheelBufferControl(BufferControl):
-    """BufferControl that intercepts the wheel and forwards it to the output area,
-    instead of trying to scroll inside the (small) input buffer."""
+    """BufferControl che intercetta la rotella e la manda all'output area,
+    invece di provare a scrollare dentro il buffer di input (che e piccolo)."""
     def mouse_handler(self, mouse_event):
         res = _wheel_scroll_output(mouse_event)
         if res is NotImplemented:
@@ -464,9 +546,9 @@ class _WheelBufferControl(BufferControl):
 
 def write(text):
     sys.stdout.write(text)
-    # In pinned mode patch_stdout's StdoutProxy accumulates until '\n'
-    # and redraws the prompt on each emit: flushing char-by-char yields
-    # one char per line. Outside patch_stdout we need the explicit flush.
+    # In modalita pinned lo StdoutProxy di patch_stdout accumula fino ai '\n'
+    # e ridisegna il prompt su ogni emit: se flushiamo char-by-char vediamo un
+    # carattere per riga. Fuori da patch_stdout serve il flush esplicito.
     if not _PINNED_MODE:
         sys.stdout.flush()
 
@@ -488,7 +570,7 @@ def box(lines, color=ORANGE, min_width=64, padding=1):
     print(bot)
 
 def welcome():
-    # In fullscreen: clear the output buffer instead of writing escape "clear" to the tty.
+    # In fullscreen: pulisci il buffer di output invece di scrivere escape "clear" al tty.
     if _PINNED_MODE:
         with _output_lock:
             _output_chunks.clear()
@@ -500,38 +582,38 @@ def welcome():
     lines = [
         f"{c('◈', GREEN)} {ORANGE}{BOLD}LOKI{R} {c(f'v{VERSION}', DIM)}",
         "",
-        f"  {c('/help', ORANGE)} for help  {c('·', DGRAY)}  {c('/exit', ORANGE)} to quit",
+        f"  {c('/help', ORANGE)} per aiuto  {c('·', DGRAY)}  {c('/exit', ORANGE)} per uscire",
         "",
         f"  {c('cwd', DIM)}    {os.getcwd()}",
         f"  {c('model', DIM)}  {MODEL}",
     ]
     box(lines)
     tips = [
-        "Type '/' to see the available commands",
-        "Use \\ + Enter to add a newline",
-        "Up/down arrows to navigate history",
-        "Ctrl+R to search history",
-        "/last to review the last full output",
-        "/think toggles visible reasoning",
-        "/auto to auto-approve commands",
-        "Ctrl+C during streaming stops the current turn",
-        "Alt+M to re-enable mouse selection",
+        "Digita '/' per vedere i comandi disponibili",
+        "Usa \\ + Invio per andare a capo",
+        "Freccia su/giu per navigare la cronologia",
+        "Ctrl+R per cercare nella cronologia",
+        "/last per rivedere l'ultimo output completo",
+        "/think per attivare/disattivare il ragionamento visibile",
+        "/auto per approvare automaticamente i comandi",
+        "Ctrl+C durante lo streaming ferma il turno corrente",
+        "Alt+M per riattivare la selezione col mouse",
     ]
     print(f"\n  {c('Tip', GRAY)} {c(random.choice(tips), DIM)}\n")
 
 def show_help():
     print()
-    print(f"  {c('COMMANDS', BOLD)}")
+    print(f"  {c('COMANDI', BOLD)}")
     for cmd, desc in SLASH_COMMANDS.items():
         print(f"    {c(cmd.ljust(12), ORANGE)} {c(desc, GRAY)}")
     print()
-    print(f"  {c('KEYBOARD', BOLD)}")
+    print(f"  {c('TASTIERA', BOLD)}")
     keys = [
-        ("Enter",           "send message"),
-        ("\\ + Enter",      "new line"),
-        ("up/down arrows",  "command history"),
-        ("Ctrl+R",          "search history"),
-        ("Ctrl+C / Ctrl+D", "exit"),
+        ("Invio",          "invia messaggio"),
+        ("\\ + Invio",     "nuova riga"),
+        ("freccia su/giu", "cronologia comandi"),
+        ("Ctrl+R",         "ricerca cronologia"),
+        ("Ctrl+C / Ctrl+D","esci"),
     ]
     for k, desc in keys:
         print(f"    {c(k.ljust(18), CYAN)} {c(desc, GRAY)}")
@@ -545,28 +627,28 @@ def show_stats():
     think_state = c('ON', GREEN) if stats['show_thinking'] else c('OFF', GRAY)
     ac_state    = c('ON', GREEN) if stats['auto_continue'] else c('OFF', GRAY)
     print()
-    print(f"  {c('SESSION', BOLD)}")
-    print(f"    {c('elapsed', DIM):<20} {mins}m {secs}s")
-    print(f"    {c('messages', DIM):<20} {stats['messages']}")
-    print(f"    {c('commands ok', DIM):<20} {c(str(stats['tools_ok']), GREEN)}")
-    print(f"    {c('commands no', DIM):<20} {c(str(stats['tools_no']), RED)}")
+    print(f"  {c('SESSIONE', BOLD)}")
+    print(f"    {c('durata', DIM):<20} {mins}m {secs}s")
+    print(f"    {c('messaggi', DIM):<20} {stats['messages']}")
+    print(f"    {c('comandi ok', DIM):<20} {c(str(stats['tools_ok']), GREEN)}")
+    print(f"    {c('comandi no', DIM):<20} {c(str(stats['tools_no']), RED)}")
     print(f"    {c('auto approve', DIM):<20} {auto_state}")
-    print(f"    {c('show thinking', DIM):<20} {think_state}")
+    print(f"    {c('mostra thinking', DIM):<20} {think_state}")
     print(f"    {c('auto continue', DIM):<20} {ac_state}")
     print(f"    {c('working ctx', DIM):<20} {stats['working_ctx']} / {MAX_CTX} tk")
     if stats['ctx_used']:
         pct = int(100 * stats['ctx_used'] / stats['working_ctx'])
-        print(f"    {c('last ctx used', DIM):<20} {stats['ctx_used']} tk ({pct}%)")
+        print(f"    {c('ctx usato ultimo', DIM):<20} {stats['ctx_used']} tk ({pct}%)")
     print()
 
 def _confirm_sync(command):
-    """Confirmation modal via input() on stdin. Used in legacy mode or
-    inside run_in_terminal (which detaches stdin from the pinned app)."""
+    """Modal di conferma con input() da stdin. Vale in modalita legacy o
+    dentro run_in_terminal (che detacha stdin dall'app pinned)."""
     print()
     print(f"  {c('⏺', ORANGE)} {c('Bash', BOLD)}  {c(command, CYAN)}")
-    print(f"     {c('1', BOLD)} {c('·', DGRAY)} Yes, run")
-    print(f"     {c('2', BOLD)} {c('·', DGRAY)} Yes, and don't ask again for this session")
-    print(f"     {c('3', BOLD)} {c('·', DGRAY)} No, stop here")
+    print(f"     {c('1', BOLD)} {c('·', DGRAY)} Si, esegui")
+    print(f"     {c('2', BOLD)} {c('·', DGRAY)} Si, e non chiedere piu per questa sessione")
+    print(f"     {c('3', BOLD)} {c('·', DGRAY)} No, ferma qui")
     while True:
         try:
             choice = input(f"     {c('❯', ORANGE)} ").strip()
@@ -576,14 +658,14 @@ def _confirm_sync(command):
             return True
         if choice == '2':
             stats['auto_approve'] = True
-            print(c("     auto approve enabled for this session", YELLOW))
+            print(c("     auto approve attivato per questa sessione", YELLOW))
             return True
         if choice in ('3', 'n', 'N'):
             return False
-        print(c("     invalid choice", RED))
+        print(c("     scelta non valida", RED))
 
 
-# Reference to the main event loop, populated when async_chat_loop starts.
+# Riferimento al main event loop, popolato all'avvio di async_chat_loop.
 _MAIN_LOOP = None
 
 
@@ -597,7 +679,7 @@ def confirm_command(command):
     if app is None or _MAIN_LOOP is None:
         return _confirm_sync(command)
 
-    # Pinned async mode: suspend the app with run_in_terminal and ask for confirmation
+    # Modalita async pinned: sospendi l'app con run_in_terminal e chiedi conferma
     import concurrent.futures
     fut = concurrent.futures.Future()
 
@@ -611,7 +693,7 @@ def confirm_command(command):
     try:
         return fut.result(timeout=300)
     except concurrent.futures.TimeoutError:
-        print(c("     confirm timeout — command rejected", RED))
+        print(c("     timeout conferma — comando rifiutato", RED))
         return False
 
 def detect_script_context(command, output):
@@ -650,20 +732,41 @@ def print_output_block(command, full_output, expand=False):
 
     if not expand and total > PREVIEW_LINES:
         hidden = total - PREVIEW_LINES
-        # No blocking input(): just show a hint.
-        # The user can always reread the full output with /last.
-        print(f"     {c(f'{hidden} lines hidden — use /last to see the full output', DIM)}")
+        # Niente input() bloccante: mostriamo un hint e basta.
+        # L'utente puo sempre rileggere l'output completo con /last.
+        print(f"     {c(f'{hidden} righe nascoste — usa /last per vedere tutto', DIM)}")
 
 def truncate_for_model(output):
+    orig_chars = len(output)
     lines = output.splitlines()
     total = len(lines)
-    if total <= OUTPUT_MAX_LINES:
-        return output
-    head    = lines[:OUTPUT_HEAD_LINES]
-    tail    = lines[-OUTPUT_TAIL_LINES:]
-    omitted = total - OUTPUT_HEAD_LINES - OUTPUT_TAIL_LINES
-    sep     = f"\n[... {omitted} lines omitted — use grep/head/tail if you need the middle ...]\n"
-    return "\n".join(head) + sep + "\n".join(tail)
+    truncated = False
+
+    if total > OUTPUT_MAX_LINES:
+        head    = lines[:OUTPUT_HEAD_LINES]
+        tail    = lines[-OUTPUT_TAIL_LINES:]
+        omitted = total - OUTPUT_HEAD_LINES - OUTPUT_TAIL_LINES
+        sep     = f"\n[... {omitted} righe omesse — usa grep/head/tail se ti serve il centro ...]\n"
+        result  = "\n".join(head) + sep + "\n".join(tail)
+        truncated = True
+    else:
+        result = output
+
+    # Hard cap in caratteri: cattura righe-monstre (JSON minificato, base64, log su una riga)
+    # che il limite per-riga non intercetta.
+    if len(result) > OUTPUT_MAX_CHARS:
+        keep  = OUTPUT_MAX_CHARS // 2
+        cut   = len(result) - OUTPUT_MAX_CHARS
+        result = (result[:keep]
+                  + f"\n[... {cut} char omessi al centro ...]\n"
+                  + result[-keep:])
+        truncated = True
+
+    if truncated:
+        result += (f"\n[output troncato: {len(result)} char inviati su "
+                   f"{orig_chars} totali ({total} righe) — "
+                   f"usa grep/head/tail/sed per estrarre solo cio' che serve]")
+    return result
 
 def _maybe_sudo_apt(command):
     stripped = command.lstrip()
@@ -671,36 +774,100 @@ def _maybe_sudo_apt(command):
         return 'sudo ' + command
     return command
 
+def run_web_search(query):
+    """Cerca online via Jina AI reader + DuckDuckGo Lite. Nessuna API key richiesta."""
+    import urllib.parse
+    query = query.strip()
+    if not query:
+        return "Errore: query vuota"
+    q = urllib.parse.quote_plus(query)
+    jina_url = f"https://r.jina.ai/https://lite.duckduckgo.com/lite/?q={q}"
+    cmd = f"curl -s --max-time 15 '{jina_url}'"
+    print(f"  {c('web_search:', BLUE)} {query}")
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=18)
+        text = r.stdout.strip()
+        if not text:
+            return f"Nessun risultato per: {query}"
+        # Filtra righe utili: salta redirect DDG e header Jina
+        lines = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if any(skip in line for skip in ('duckduckgo.com/l/?uddg=', 'URL Source:', 'Title:', 'Markdown Content:')):
+                continue
+            if line in ('---', '===', '\\---'):
+                continue
+            if len(line) > 15:
+                lines.append(line)
+        result = '\n'.join(lines)
+        if len(result) > 2000:
+            result = result[:2000] + '\n[...troncato]'
+        return result if result.strip() else f"Nessun risultato utile per: {query}"
+    except subprocess.TimeoutExpired:
+        return "TIMEOUT: web_search ha superato 18 secondi"
+    except Exception as e:
+        return f"Errore web_search: {e}"
+
+def run_workspace_write(file, content, mode):
+    if file not in WORKSPACE_FILES:
+        return f"File non permesso: {file}. Usa: {', '.join(sorted(WORKSPACE_FILES))}"
+    os.makedirs(WORKSPACE_DIR, exist_ok=True)
+    path = os.path.join(WORKSPACE_DIR, file)
+    flag = 'a' if mode == 'append' else 'w'
+    with open(path, flag, encoding='utf-8') as f:
+        if mode == 'append':
+            f.write('\n' + content)
+        else:
+            f.write(content)
+    preview = content[:120] + ('...' if len(content) > 120 else '')
+    print(f"  {c('workspace_write:', BLUE)} [{mode}] {file}: {preview}")
+    return f"OK: {file} aggiornato ({len(content)} caratteri, mode={mode})"
+
+def run_workspace_read(file):
+    if file not in WORKSPACE_FILES:
+        return f"File non permesso: {file}. Usa: {', '.join(sorted(WORKSPACE_FILES))}"
+    path = os.path.join(WORKSPACE_DIR, file)
+    if not os.path.exists(path):
+        return f"{file}: (vuoto — nessuna nota salvata)"
+    with open(path, 'r', encoding='utf-8') as f:
+        content = f.read()
+    if not content.strip():
+        return f"{file}: (vuoto)"
+    print(f"  {c('workspace_read:', BLUE)} {file} ({len(content)} chars)")
+    return content if len(content) <= 3000 else content[:3000] + '\n[...troncato]'
+
 def run_shell(command):
     command = _maybe_sudo_apt(command)
     if not confirm_command(command):
         stats['tools_no'] += 1
         _bashing_event.clear()
-        return "COMMAND REJECTED BY THE USER"
+        return "COMANDO RIFIUTATO DALL'UTENTE"
     stats['tools_ok'] += 1
-    _bashing_event.set()  # spinner -> "bashing..." for the whole subprocess duration
+    _bashing_event.set()  # spinner -> "bashing..." per tutta la durata del subprocess
     try:
         result = subprocess.run(
             command, shell=True, capture_output=True,
             text=True, timeout=30
         )
-        output = (result.stdout + result.stderr).strip() or "(no output)"
+        output = (result.stdout + result.stderr).strip() or "(nessun output)"
         stats['last_command'] = command
-        stats['last_output'] = output                # full text for /last
-        model_output = truncate_for_model(output)    # truncated for the model
-        print_output_block(command, output)          # full display (UI truncates at PREVIEW_LINES)
+        stats['last_output'] = output                # completo per /last
+        model_output = truncate_for_model(output)    # troncato per il modello
+        print_output_block(command, output)          # display intero (truncato dall'UI a PREVIEW_LINES)
         return model_output
     except subprocess.TimeoutExpired:
         print(c("     TIMEOUT (>30s)", RED))
-        return "TIMEOUT: command exceeded 30 seconds"
+        return "TIMEOUT: comando ha superato 30 secondi"
     finally:
-        # Command finished: revert to "cooking..." for the possible
-        # model continuation that reflects on the output.
+        # Comando finito: torna a "cooking..." per l'eventuale continuazione
+        # del modello (che riflette sull'output).
         _bashing_event.clear()
 
 def show_last():
     if not stats['last_output']:
-        print(c("  no previous output\n", DIM))
+        print(c("  nessun output precedente\n", DIM))
         return
     print()
     print_output_block(stats['last_command'] or '', stats['last_output'], expand=True)
@@ -715,14 +882,14 @@ def load_memory():
 def append_memory(text):
     with open(MEMORY_FILE, 'a') as f:
         f.write(f"\n\n{text.strip()}")
-    print(f"  {c('memory updated:', DIM)} {MEMORY_FILE}\n")
+    print(f"  {c('memoria aggiornata:', DIM)} {MEMORY_FILE}\n")
 
 def show_memory():
     mem = load_memory()
     if not mem:
-        print(c("  memory empty\n", DIM))
+        print(c("  memoria vuota\n", DIM))
         return
-    print(f"\n  {c('MEMORY', BOLD)}\n")
+    print(f"\n  {c('MEMORIA', BOLD)}\n")
     for line in mem.splitlines():
         print(f"  {line}")
     print()
@@ -737,17 +904,80 @@ def build_system_prompt():
         "Be direct and technical. Skip disclaimers. Never repeat the executed command in the final response. "
         "Never use emoji."
     )
+    ops = (
+        "\n\n## REGOLE OPERATIVE — efficienza del contesto"
+        "\nIl tuo context window e' limitato: ogni output di comando lo consuma. Lavora parsimonioso."
+        "\n- Prima di eseguire stima se l'output sara' grande. Se puo' esserlo, filtralo ALLA FONTE:"
+        " `head -50 file`, `grep PATTERN file`, `cmd | head -30`, `wc -l`. Mai `cat` di file grandi."
+        "\n- Anteponi `timeout N` ai comandi che possono bloccarsi (rete, scansioni, prompt interattivi)."
+        " Non lanciare comandi che restano in foreground senza timeout."
+        "\n- Per task in piu' passi: scrivi un piano breve in 3-5 punti, poi eseguilo un passo alla volta."
+        " Aggiorna il piano dopo ogni passo. Niente raffiche di comandi tutti insieme."
+        "\n- Usa il comando MINIMO che produce l'informazione che ti serve adesso."
+        " `cmd --help | head -30` invece del man completo. `ls dir | head` invece del ricorsivo."
+        "\n- Non ripetere un comando fallito identico: cambia approccio, opzioni o strumento."
+        " Se l'output e' stato troncato, restringilo con grep/sed/head invece di rilanciarlo raw."
+        "\n- Se un flag, sintassi o strumento ti e' sconosciuto o ha dato errore inspiegabile,"
+        " usa SUBITO web_search prima di provare a indovinare. E' piu' veloce di 10 tentativi ciechi."
+        "\n- Ragiona conciso. Pianifica, poi agisci. Punta alla risposta col minor numero di comandi."
+    )
+    think = (
+        "\n\n## DISCIPLINA DEL RAGIONAMENTO — vincolo assoluto"
+        "\n**NEMICO PRINCIPALE**: il reasoning loop — ragionare su 2+ alternative senza eseguirne"
+        " nessuna, o considerare la stessa opzione 2+ volte. Questo consuma context window senza"
+        " produrre informazioni reali. L'output di un comando fallito vale piu' di 1000 token di"
+        " ragionamento a priori."
+        "\n\n**CONTRATTO OBBLIGATORIO — ogni turno di thinking DEVE terminare con UNA di queste due:**"
+        "\n  A) una tool call (run_shell o web_search)"
+        "\n  B) una risposta finale in testo all'utente"
+        "\nNon esiste opzione C (thinking senza azione). Se stai per scegliere C, scegli A."
+        "\n\n**TRIPWIRE — queste condizioni scatenano una tool call IMMEDIATA, senza ulteriore reasoning:**"
+        "\n- Conosci gia' il comando da eseguire → eseguilo ORA. Non pensarci ancora."
+        "\n- Hai coordinate x,y per xdotool → lancia `xdotool click X Y` ORA."
+        "\n- Hai un path, un PID, una env var da verificare → usa run_shell ORA."
+        "\n- Hai considerato la stessa opzione 2+ volte → prendi la piu' probabile, eseguila ORA."
+        "\n- Hai fatto 3+ passi di reasoning senza tool call → lancia `echo 'CP: [stato]'` ORA."
+        "\n- Un comando ha fallito con errore non ovvio → diagnostica ORA: `cat /proc/PID/environ`,"
+        " `echo $DISPLAY`, `which CMD`, `ls -la PATH`. Non ragionare sul perche'."
+        "\n- Non conosci la sintassi esatta di un flag → usa web_search ORA, non indovinare."
+        "\n\n**REGOLA DEL PIANO SCRITTO**: all'inizio di ogni task esegui SUBITO"
+        " `echo 'PIANO: 1)... 2)... 3)...'`. Il thinking serve a PIANIFICARE il prossimo"
+        " singolo passo, non a deliberare tra opzioni gia' identificate."
+        "\n\n**IL TUO THINKING NON E' SALVATO NEL CONTESTO.** Se viene troncato e' perso."
+        " Ogni pensiero che non culmina in una tool call e' context window bruciata."
+    )
+    workspace = (
+        "\n\n## WORKSPACE — memoria persistente tra i turni"
+        "\n- workspace_write/read: file .md in ~/.loki_workspace/ che sopravvivono tra i turni."
+        "\n- Il tuo thinking viene scartato dopo ogni turno. I file no."
+        "\n- REGOLA: se ti ritrovi a pensare la stessa cosa per la seconda volta → scrivi su workspace invece."
+        "\n- plan.md: piano passi corrente (aggiorna dopo ogni passo completato)"
+        "\n- failures.md: cosa hai provato che NON ha funzionato (leggi PRIMA di riprovare)"
+        "\n- ideas.md: opzioni considerate, pro/contro"
+        "\n- notes.md: osservazioni, output importanti da ricordare"
+        "\n- scratch.md: bozze libere"
+        "\n- TRIPWIRE: stai considerando 3+ opzioni? → workspace_write su ideas.md ORA, poi decidi."
+    )
+    plan_path = os.path.join(WORKSPACE_DIR, "plan.md")
+    plan_section = ""
+    try:
+        if os.path.exists(plan_path):
+            with open(plan_path, 'r', encoding='utf-8') as _f:
+                _plan = _f.read().strip()
+            if _plan:
+                plan_section = f"\n\n## PIANO CORRENTE (da workspace)\n{_plan}"
+    except Exception:
+        pass
     mem = load_memory()
-    if mem:
-        return base + f"\n\n## PERSISTENT MEMORY\n{mem}"
-    return base
+    mem_section = f"\n\n## MEMORIA PERSISTENTE\n{mem}" if mem else ""
+    return base + ops + think + workspace + mem_section + plan_section
 
 def _find_turn_start(messages, idx):
-    """Move idx backwards until it lands on a 'user' message.
+    """Sposta idx all'indietro finche non atterra su un messaggio 'user'.
 
-    Prevents 'recent' from starting with an orphan 'tool' (whose assistant/tool_call
-    ended up in to_compress) or an assistant reply to a now-lost tool_call.
-    A 'user' message is a clean turn boundary.
+    Evita che 'recent' inizi con un 'tool' orfano (il cui assistant/tool_call
+    e finito in to_compress) o con un assistant risposta a un tool_call ora
+    perso. Un 'user' e un confine di turno pulito.
     """
     while idx > 1 and messages[idx]['role'] != 'user':
         idx -= 1
@@ -773,27 +1003,27 @@ def _fmt_msg_for_summary(msg, txt_lim=2000, tool_lim=1500):
         if len(body) > tool_lim:
             half = tool_lim // 2
             omitted = len(body) - tool_lim
-            body = f"{body[:half]}\n[... {omitted} chars omitted ...]\n{body[-half:]}"
+            body = f"{body[:half]}\n[... {omitted} char omessi ...]\n{body[-half:]}"
         return f"[tool_output]: {body}"
     return f"[{role}]: {content[:txt_lim]}"
 
 
 def _rotate_memory_summaries():
-    """Keep at most MEMORY_MAX_SUMMARIES session summaries in the file.
+    """Mantiene al piu MEMORY_MAX_SUMMARIES riassunti di sessione nel file.
 
-    User manual notes (`/remember`) at the top stay intact. Also applies a
-    byte hard cap via loki_mem.enforce_hard_cap: if after rotation the file
-    is still too large (many manual notes, giant summaries), it trims from
-    the top with an explicit marker.
+    Le note manuali dell'utente (`/remember`) restano intatte in cima.
+    Applica anche un hard cap in byte via loki_mem.enforce_hard_cap: se
+    dopo la rotazione il file e ancora troppo grosso (tante note manuali,
+    riassunti giganti), taglia dalla cima con marker esplicito.
     """
     loki_mem.rotate_summaries(MEMORY_FILE, max_summaries=MEMORY_MAX_SUMMARIES)
     loki_mem.enforce_hard_cap(MEMORY_FILE)
 
 
 def detect_max_ctx():
-    """Query Ollama for the model's real context length.
+    """Interroga Ollama per la context length reale del modello.
 
-    If the call fails (Ollama down, model not found) it leaves the default.
+    Se la chiamata fallisce (Ollama down, modello non trovato) lascia il default.
     """
     global MAX_CTX
     try:
@@ -807,32 +1037,50 @@ def detect_max_ctx():
         pass
 
 
+def estimate_context_tokens(messages):
+    """Stima grezza dei token nel contesto (~4 char/token).
+
+    Serve alla compressione pre-emptiva: decidere PRIMA di inviare invece di
+    scoprire a posteriori (done_reason=length) che il prompt era troppo grande.
+    stats['ctx_used'] non basta perche' e' il conteggio del turno PRECEDENTE.
+    """
+    chars = 0
+    for m in messages:
+        chars += len(m.get('content') or '')
+        chars += len(m.get('thinking') or '')
+        for tc in (m.get('tool_calls') or []):
+            fn   = tc.get('function', {}) if isinstance(tc, dict) else {}
+            args = fn.get('arguments', {}) or {}
+            chars += len(str(args))
+    return chars // 4
+
+
 def compress_context(messages):
     if len(messages) <= 3:
-        print(c("  conversation too short to compress\n", DIM))
+        print(c("  conversazione troppo corta da comprimere\n", DIM))
         return messages
 
     keep_start = max(1, len(messages) - KEEP_RECENT_MSG)
     keep_start = _find_turn_start(messages, keep_start)
     to_compress = messages[1:keep_start]
     if not to_compress:
-        print(c("  nothing to compress\n", DIM))
+        print(c("  niente da comprimere\n", DIM))
         return messages
 
-    MAX_TRANSCRIPT = 12000  # more room: we now include tool_output too
+    MAX_TRANSCRIPT = 12000  # piu spazio: ora includiamo anche tool_output
     raw_transcript = "\n\n".join(_fmt_msg_for_summary(m) for m in to_compress)
     if len(raw_transcript) > MAX_TRANSCRIPT:
         half = MAX_TRANSCRIPT // 2
         transcript = (
             raw_transcript[:half]
-            + f"\n\n[... {len(raw_transcript) - MAX_TRANSCRIPT} chars omitted ...]\n\n"
+            + f"\n\n[... {len(raw_transcript) - MAX_TRANSCRIPT} caratteri omessi ...]\n\n"
             + raw_transcript[-half:]
         )
     else:
         transcript = raw_transcript
 
     BAR_W   = 24
-    EST_MAX = 1500   # estimated tokens for the summary (bar ceiling)
+    EST_MAX = 1500   # token stimati per il riassunto (tetto barra)
     SPIN    = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
 
     def _render_bar(chars, done=False):
@@ -840,15 +1088,15 @@ def compress_context(messages):
         filled = min(BAR_W, int(BAR_W * approx / EST_MAX)) if not done else BAR_W
         bar    = '█' * filled + '░' * (BAR_W - filled)
         color  = GREEN if done else ORANGE
-        return f"\r  {c('◎ compressing', PURPLE)}  {DGRAY}[{R}{color}{bar}{R}{DGRAY}]{R}  {c(f'~{approx}tk', DGRAY)}  "
+        return f"\r  {c('◎ compressione', PURPLE)}  {DGRAY}[{R}{color}{bar}{R}{DGRAY}]{R}  {c(f'~{approx}tk', DGRAY)}  "
 
-    # show spinner while the model processes the prompt (before the first token)
+    # mostra spinner mentre il modello elabora il prompt (prima del primo token)
     spin_i     = [0]
     first_seen = [False]
 
     def _spin():
         ch = SPIN[spin_i[0] % len(SPIN)]
-        write(f"\r  {c('◎ compressing', PURPLE)}  {DGRAY}{ch} processing...{R}        ")
+        write(f"\r  {c('◎ compressione', PURPLE)}  {DGRAY}{ch} elaborando...{R}        ")
         spin_i[0] += 1
 
     import threading
@@ -870,21 +1118,22 @@ def compress_context(messages):
             model=MODEL,
             messages=[{
                 "role": "system",
-                "content": "You are an assistant that summarizes conversations between a user and a shell agent in a dense, precise way in English."
+                "content": "Sei un assistente che riassume conversazioni tra utente e shell agent in modo denso e preciso in italiano."
             }, {
                 "role": "user",
                 "content": (
-                    "Summarize this conversation into a concise markdown block. "
-                    "[tool_call] blocks are executed commands, [tool_output] blocks are their output. "
-                    "Preserve: technical facts discovered, files/paths/hosts/ports encountered, "
-                    "decisions taken, user goals not yet completed, and any relevant errors. "
-                    f"Ignore small talk and trivial confirmations:\n\n{transcript}"
+                    "Riassumi questa conversazione in un blocco markdown conciso. "
+                    "I blocchi [tool_call] indicano comandi eseguiti, i blocchi "
+                    "[tool_output] il loro output. Preserva: fatti tecnici scoperti, "
+                    "file/percorsi/host/porte incontrati, decisioni prese, obiettivi "
+                    "dell'utente non ancora completati, ed eventuali errori rilevanti. "
+                    f"Ignora chiacchiere e conferme banali:\n\n{transcript}"
                 )
             }],
             stream=True,
-            # compress is a one-shot on a transcript already trimmed to 12000 chars:
-            # we don't need all of MAX_CTX, a small ceiling avoids reallocating
-            # a huge KV cache for a short task.
+            # compress e un one-shot su transcript gia troncato a 12000 char:
+            # non serve tutto MAX_CTX, un tetto piccolo evita che Ollama
+            # rialloci un KV cache enorme per un compito breve.
             options={
                 'num_ctx':     min(COMPRESS_CTX, MAX_CTX),
                 'num_predict': 1500,
@@ -903,21 +1152,21 @@ def compress_context(messages):
                 write(_render_bar(chars))
     except KeyboardInterrupt:
         stop_spin.set()
-        write(f"\r  {c('⚠ compression interrupted — context unchanged', YELLOW)}        \n\n")
+        write(f"\r  {c('⚠ compressione interrotta — contesto invariato', YELLOW)}        \n\n")
         return messages
     except Exception as e:
         stop_spin.set()
-        write(f"\r  {c(f'compression error: {e}', RED)}        \n\n")
+        write(f"\r  {c(f'errore compressione: {e}', RED)}        \n\n")
         return messages
 
     stop_spin.set()
 
     write(_render_bar(chars, done=True))
-    write(f"\r  {c('◎ compressing', PURPLE)}  {c('[' + '█' * BAR_W + ']', GREEN)}  {c('✓ done', GREEN)}        \n")
+    write(f"\r  {c('◎ compressione', PURPLE)}  {c('[' + '█' * BAR_W + ']', GREEN)}  {c('✓ fatto', GREEN)}        \n")
 
     summary = "".join(summary_parts)
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-    append_memory(f"### Compressed session {ts}\n{summary}")
+    append_memory(f"### Sessione compressa {ts}\n{summary}")
     _rotate_memory_summaries()
 
     recent = messages[keep_start:]
@@ -927,7 +1176,7 @@ def compress_context(messages):
             m = {k: v for k, v in m.items() if k != 'thinking'}
         recent_clean.append(m)
     new_messages = [{"role": "system", "content": build_system_prompt()}] + recent_clean
-    print(f"  {c('✓ saved to memory', GREEN)}  {c(f'{len(to_compress)} messages compressed', GRAY)}\n")
+    print(f"  {c('✓ salvato in memoria', GREEN)}  {c(f'{len(to_compress)} messaggi compressi', GRAY)}\n")
     return new_messages
 
 def _session_path(name):
@@ -961,11 +1210,11 @@ def save_session(messages, name=None):
     path = _session_path(name)
     with open(path, 'w') as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
-    print(f"\n  {c('session saved:', DIM)} {c(name, ORANGE)}  {c(path, DGRAY)}\n")
+    print(f"\n  {c('sessione salvata:', DIM)} {c(name, ORANGE)}  {c(path, DGRAY)}\n")
     return name
 
 def _replay_message(m):
-    """Reprint a single saved message in the chat's compact format."""
+    """Ristampa un singolo messaggio salvato nel formato compatto della chat."""
     role = m.get('role')
     content = m.get('content', '') or ''
     if role == 'user':
@@ -991,26 +1240,26 @@ def _replay_message(m):
         for line in lines[:15]:
             print(f"     {c('│', DGRAY)} {line}")
         if len(lines) > 15:
-            print(f"     {c(f'     ... {len(lines) - 15} lines omitted', DIM)}")
+            print(f"     {c(f'     ... {len(lines) - 15} righe omesse', DIM)}")
         print(f"     {c('└' + '─' * w, DGRAY)}")
 
 
 def resume_session(arg, messages):
-    """/resume — if `arg` is empty: list. Otherwise: load + reprint history.
-    Returns the new messages list to put in state, or None."""
+    """/resume — se `arg` e vuoto: elenca. Altrimenti: carica + ristampa storia.
+    Ritorna la nuova lista messaggi da mettere in state, oppure None."""
     files = sorted(
         [f for f in os.listdir(SESSIONS_DIR) if f.endswith('.json')],
         reverse=True,
     )
     entries = [f[:-5] for f in files]
 
-    # -- no argument: list --
+    # -- nessun argomento: elenca --
     if not arg:
         if not entries:
-            print(c("\n  no saved sessions\n", DIM))
+            print(c("\n  nessuna sessione salvata\n", DIM))
             return None
         print()
-        print(f"  {c('SAVED SESSIONS', BOLD)}")
+        print(f"  {c('SESSIONI SALVATE', BOLD)}")
         for i, name in enumerate(entries, 1):
             path = _session_path(name)
             try:
@@ -1022,40 +1271,40 @@ def resume_session(arg, messages):
                 n_msg, saved = 0, '?'
             print(f"    {c(str(i).rjust(2), ORANGE)}  {c(name.ljust(24), BOLD)}  "
                   f"{c(saved, DIM)}  {c(f'{n_msg} msg', GRAY)}")
-        print(f"\n  {c('to resume one:', DIM)} {c('/resume <number|name>', ORANGE)}\n")
+        print(f"\n  {c('per riprenderne una:', DIM)} {c('/resume <numero|nome>', ORANGE)}\n")
         return None
 
-    # -- with argument: load --
+    # -- con argomento: carica --
     if arg.isdigit():
         idx = int(arg) - 1
         if 0 <= idx < len(entries):
             arg = entries[idx]
         else:
-            print(c(f"\n  invalid number: {arg}\n", RED))
+            print(c(f"\n  numero non valido: {arg}\n", RED))
             return None
     path = _session_path(arg)
     if not os.path.isfile(path):
-        print(c(f"\n  session not found: {arg}\n", RED))
+        print(c(f"\n  sessione non trovata: {arg}\n", RED))
         return None
     with open(path) as f:
         data = json.load(f)
     loaded = data.get('messages', [])
     n_user = len([m for m in loaded if m['role'] == 'user'])
 
-    # Clear the output area and reprint banner + history.
+    # Pulisce l'output area e ristampa banner + storia.
     if _PINNED_MODE:
         with _output_lock:
             _output_chunks.clear()
     fill = max(1, term_width() - 4)
-    print(f"\n  {c('◈', GREEN)} {c('Session resumed:', DIM)} {c(arg, ORANGE)}  "
-          f"{c(f'{n_user} user messages', GRAY)}")
+    print(f"\n  {c('◈', GREEN)} {c('Sessione ripresa:', DIM)} {c(arg, ORANGE)}  "
+          f"{c(f'{n_user} messaggi utente', GRAY)}")
     print(f"  {c('─' * fill, GRAY)}")
     for m in loaded:
         _replay_message(m)
     print(f"\n  {c('─' * fill, GRAY)}")
-    print(f"  {c('▸ keep typing below', DIM)}\n")
+    print(f"  {c('▸ continua a scrivere qui sotto', DIM)}\n")
 
-    return messages[:1] + loaded  # system prompt + resumed messages
+    return messages[:1] + loaded  # system prompt + messaggi ripresi
 
 def parse_slash(text, messages=None):
     parts = text.strip().split(maxsplit=1)
@@ -1069,7 +1318,7 @@ def parse_slash(text, messages=None):
     if cmd in ('/clear', '/reset'):
         return 'clear', None
     if cmd == '/model':
-        print(f"  {c('model:', DIM)} {MODEL}\n")
+        print(f"  {c('modello:', DIM)} {MODEL}\n")
         return 'handled', None
     if cmd == '/cwd':
         print(f"  {c('cwd:', DIM)} {os.getcwd()}\n")
@@ -1091,7 +1340,7 @@ def parse_slash(text, messages=None):
         if arg.strip():
             append_memory(arg.strip())
         else:
-            print(c("  usage: /remember <text>\n", GRAY))
+            print(c("  uso: /remember <testo>\n", GRAY))
         return 'handled', None
     if cmd == '/memory':
         show_memory()
@@ -1103,7 +1352,7 @@ def parse_slash(text, messages=None):
     if cmd == '/think':
         stats['show_thinking'] = not stats['show_thinking']
         state = c('ON', GREEN) if stats['show_thinking'] else c('OFF', GRAY)
-        print(f"  {c('show thinking:', DIM)} {state}\n")
+        print(f"  {c('mostra thinking:', DIM)} {state}\n")
         return 'handled', None
     if cmd in ('/history', '/cost'):
         show_stats()
@@ -1115,7 +1364,7 @@ def parse_slash(text, messages=None):
         if messages is not None:
             arg = arg.strip()
             if not arg and _PINNED_MODE:
-                # In fullscreen: activate the interactive picker
+                # In fullscreen: attiva il picker interattivo
                 return 'picker', None
             result = resume_session(arg, messages)
             if result is not None:
@@ -1126,22 +1375,22 @@ def parse_slash(text, messages=None):
         if payload is None:
             age = loki_persist.autosave_age_seconds(SESSIONS_DIR)
             if age is None:
-                print(c("  no autosave present\n", DIM))
+                print(c("  nessun autosave presente\n", DIM))
             else:
                 hrs = age // 3600
-                print(c(f"  autosave too old ({hrs}h ago) — ignored\n", DIM))
+                print(c(f"  autosave troppo vecchio ({hrs}h fa) — ignorato\n", DIM))
             return 'handled', None
         age = loki_persist.autosave_age_seconds(SESSIONS_DIR) or 0
         mins_ago = age // 60
         raw = payload.get('messages', [])
         new_msgs = [{"role": "system", "content": build_system_prompt()}] + raw
         n_user = sum(1 for m in raw if m.get('role') == 'user')
-        print(f"\n  {c('◈ autosave restored', GREEN)}  "
-              f"{c(f'{n_user} user messages · {mins_ago}m ago', GRAY)}\n")
+        print(f"\n  {c('◈ autosave riesumato', GREEN)}  "
+              f"{c(f'{n_user} messaggi utente · {mins_ago}m fa', GRAY)}\n")
         return 'resume', new_msgs
     if cmd == '/hw':
         if HW is None:
-            print(c("  HW not detected yet\n", DIM))
+            print(c("  HW non ancora rilevato\n", DIM))
         else:
             line = loki_hw.hw_line(HW, stats['working_ctx'], MAX_CTX)
             print(f"\n  {c('HARDWARE', BOLD)}")
@@ -1154,7 +1403,7 @@ def parse_slash(text, messages=None):
     if cmd == '/delete':
         arg = arg.strip()
         if not arg:
-            print(c("  usage: /delete <name|number>\n", GRAY))
+            print(c("  uso: /delete <nome|numero>\n", GRAY))
             return 'handled', None
         entries = [f[:-5] for f in sorted(os.listdir(SESSIONS_DIR), reverse=True) if f.endswith('.json')]
         if arg.isdigit():
@@ -1162,25 +1411,25 @@ def parse_slash(text, messages=None):
             if 0 <= idx < len(entries):
                 arg = entries[idx]
             else:
-                print(c(f"  invalid number: {arg}\n", RED))
+                print(c(f"  numero non valido: {arg}\n", RED))
                 return 'handled', None
         path = _session_path(arg)
         if not os.path.isfile(path):
-            print(c(f"  session not found: {arg}\n", RED))
+            print(c(f"  sessione non trovata: {arg}\n", RED))
         else:
             os.remove(path)
-            print(f"  {c('deleted:', DIM)} {c(arg, ORANGE)}\n")
+            print(f"  {c('eliminata:', DIM)} {c(arg, ORANGE)}\n")
         return 'handled', None
     if cmd == '/save':
         if messages:
             save_session(messages, arg.strip() or None)
         else:
-            print(c("  no messages to save\n", DIM))
+            print(c("  nessun messaggio da salvare\n", DIM))
         return 'handled', None
     if cmd == '/clone':
         cparts = arg.strip().split(maxsplit=1)
         if len(cparts) < 2:
-            print(c("  usage: /clone <source> <new_name>\n", GRAY))
+            print(c("  uso: /clone <sorgente> <nuovo_nome>\n", GRAY))
             return 'handled', None
         src_arg, dst_name = cparts[0], cparts[1].strip()
         entries = [f[:-5] for f in sorted(os.listdir(SESSIONS_DIR), reverse=True) if f.endswith('.json')]
@@ -1189,38 +1438,38 @@ def parse_slash(text, messages=None):
             if 0 <= idx < len(entries):
                 src_arg = entries[idx]
             else:
-                print(c(f"  invalid number: {src_arg}\n", RED))
+                print(c(f"  numero non valido: {src_arg}\n", RED))
                 return 'handled', None
         src_path = _session_path(src_arg)
         dst_path = _session_path(dst_name)
         if not os.path.isfile(src_path):
-            print(c(f"  session not found: {src_arg}\n", RED))
+            print(c(f"  sessione non trovata: {src_arg}\n", RED))
         elif os.path.isfile(dst_path):
-            print(c(f"  a session with this name already exists: {dst_name}\n", RED))
+            print(c(f"  esiste già una sessione con nome: {dst_name}\n", RED))
         else:
             import shutil
             shutil.copy2(src_path, dst_path)
-            print(f"  {c('cloned:', DIM)} {c(src_arg, GRAY)} {c('→', DGRAY)} {c(dst_name, ORANGE)}\n")
+            print(f"  {c('clonata:', DIM)} {c(src_arg, GRAY)} {c('→', DGRAY)} {c(dst_name, ORANGE)}\n")
         return 'handled', None
     if cmd == '/img':
         path = os.path.expanduser(arg.strip().strip('"\''))
         if os.path.isfile(path):
             stats['pending_images'].append(path)
-            print(f"  {c('image attached:', DIM)} {path}")
-            print(f"  {c('it will be sent with the next message', GRAY)}\n")
+            print(f"  {c('immagine allegata:', DIM)} {path}")
+            print(f"  {c('sara inviata col prossimo messaggio', GRAY)}\n")
         else:
-            print(c(f"  file not found: {path}\n", RED))
+            print(c(f"  file non trovato: {path}\n", RED))
         return 'handled', None
-    print(c(f"  unknown command: {cmd}\n", RED))
+    print(c(f"  comando sconosciuto: {cmd}\n", RED))
     return 'handled', None
 
 def build_session(on_submit=None):
-    """Build the PromptSession.
+    """Costruisce la PromptSession.
 
-    If `on_submit` is passed (async pinned mode), Enter calls the callback
-    and resets the buffer without returning from prompt_async(): this way
-    the prompt stays visible with its toolbar. If None, legacy synchronous
-    behavior.
+    Se `on_submit` e passato (modalita async pinned), Enter chiama la callback
+    e resetta il buffer senza far ritornare prompt_async(): cosi il prompt
+    resta sempre visibile con la sua toolbar. Se None, comportamento legacy
+    sincrono.
     """
     kb = KeyBindings()
 
@@ -1283,15 +1532,15 @@ def build_session(on_submit=None):
         bottom_toolbar=bottom_toolbar,
         mouse_support=False,
         style=toolbar_style,
-        refresh_interval=1.0,   # refresh the toolbar (timer, ctx%) every second
+        refresh_interval=1.0,   # aggiorna la toolbar (timer, ctx%) ogni secondo
     )
 
 class WordFlow:
-    """Word-aware wrapper for streaming output.
+    """Word-aware wrapper per output streaming.
 
-    Buffers characters until a word boundary (space/newline), then decides
-    whether the word fits in the current line: if not, it wraps BEFORE writing
-    it. Words longer than a full line are force-split.
+    Bufferizza i caratteri fino al confine di parola (spazio/newline), poi
+    decide se la parola entra nella riga corrente: se no, va a capo PRIMA di
+    scriverla. Parole piu lunghe di una riga intera vengono spezzate a forza.
     """
     def __init__(self, width, indent_cols, line_start, newline_prefix=None):
         self.width         = width
@@ -1382,14 +1631,14 @@ def stream_response(messages):
             keep_alive=KEEP_ALIVE,
         )
     except Exception as e:
-        print(c(f"  Ollama error: {e}\n", RED))
+        print(c(f"  Errore Ollama: {e}\n", RED))
         return None
 
     try:
         for chunk in stream:
-            # Ctrl+C from the app: interrupt the stream as if it were a
-            # real KeyboardInterrupt, so we reuse the except branch below
-            # that closes pending blocks and saves partial content.
+            # Ctrl+C dall'app: interrompiamo lo stream come se fosse un
+            # KeyboardInterrupt vero, cosi riusiamo il branch except sotto
+            # che chiude i blocchi pending e salva il contenuto parziale.
             if _cancel_event.is_set():
                 raise KeyboardInterrupt
 
@@ -1430,9 +1679,9 @@ def stream_response(messages):
                 content_buf.append(content_chunk)
 
             if tool_chunk:
-                # The model is emitting a run_shell call: the spinner flips
-                # to "bashing..." to signal we are about to execute (or are
-                # already executing) shell code.
+                # Il modello sta emettendo una chiamata a run_shell: lo spinner
+                # passa a "bashing..." per segnalare che stiamo per eseguire
+                # (o gia' eseguendo) codice shell.
                 _bashing_event.set()
                 for tc in tool_chunk:
                     tool_calls_buf.append(tc)
@@ -1450,7 +1699,7 @@ def stream_response(messages):
         elif content_started:
             content_flow.finish()
             write("\n")
-        write(f"\n  {GRAY}⚠ interrupted{R}\n\n")
+        write(f"\n  {GRAY}⚠ interrotto{R}\n\n")
         return {
             'role':       'assistant',
             'content':    ''.join(content_buf),
@@ -1485,35 +1734,52 @@ def prepare_messages_for_api(messages):
     return result
 
 def build_continue_message(last_msg):
-    """Builds a smarter 'continue' message telling the model where it left off."""
+    """Builds a smarter 'continua' that tells the model where it left off."""
     thinking = (last_msg.get('thinking') or '').strip()
     content  = (last_msg.get('content')  or '').strip()
     if content:
         tail = content[-500:]
         return (
-            "continue the response cut off by the token limit. "
-            f"You were writing: «…{tail}» — "
-            "go on without repeating what you already wrote."
+            "continua la risposta interrotta dal limite di token. "
+            f"Stavi scrivendo: «…{tail}» — "
+            "prosegui senza ripetere quanto già scritto."
         )
     if thinking:
         thinking_tail = "\n".join(thinking.splitlines()[-12:])
         return (
-            "your reasoning was cut off by the token limit.\n"
-            f"Last thoughts:\n```\n{thinking_tail}\n```\n"
-            "Complete the reasoning and produce the final answer."
+            "il tuo ragionamento è stato interrotto dal limite di token.\n"
+            f"Ultimi pensieri:\n```\n{thinking_tail}\n```\n"
+            "Completa il ragionamento e produci la risposta finale."
         )
-    return "continue"
+    return "continua"
 
 def _run_turn(state):
-    """Run the full turn (streaming + tool loop) in the executor thread.
+    """Esegue il turno completo (streaming + tool loop) nell'executor thread.
 
-    Calls stream_response and, if the model produced tool_calls, runs the
-    tools and re-invokes stream_response, like the old synchronous chat_loop.
-    All output goes through print()/write() and patch_stdout shows it above
-    the pinned prompt.
+    Chiama stream_response e, se il modello ha prodotto tool_calls, esegue i
+    tool e re-invoca stream_response, come faceva il vecchio chat_loop sincrono.
+    Tutti gli output passano per print()/write() e patch_stdout li mostra sopra
+    il prompt pinnato.
     """
     messages = state['messages']
-    consecutive_continues = 0
+
+    # Compressione pre-emptiva: intervieni PRIMA di inviare se il contesto stimato
+    # supera COMPRESS_PREEMPT del working_ctx, invece di aspettare done_reason=length.
+    est = estimate_context_tokens(messages)
+    if est >= int(stats['working_ctx'] * COMPRESS_PREEMPT):
+        new_ctx = loki_hw.next_working_ctx(stats['working_ctx'], MAX_CTX)
+        if new_ctx > stats['working_ctx']:
+            old = stats['working_ctx']
+            stats['working_ctx'] = new_ctx
+            print(f"\n  {c(f'↗ ctx esteso pre-emptive: {old} → {new_ctx} tk (~{est} tk stimati)', GRAY)}\n")
+        else:
+            pct = int(100 * est / MAX_CTX)
+            print(f"\n  {c(f'⚠ contesto ~{pct}% (~{est}/{MAX_CTX} tk) — compressione pre-emptiva...', YELLOW)}")
+            state['messages'] = compress_context(messages)
+            messages = state['messages']
+
+    length_retries   = 0   # contatore TOTALE di done_reason=length nel turno
+    no_action_strikes = 0  # turni consecutivi con solo thinking, zero azioni
     while True:
         msg = stream_response(messages)
         if msg is None:
@@ -1521,56 +1787,133 @@ def _run_turn(state):
             break
         messages.append(msg)
 
-        # If the user pressed Ctrl+C during the stream, stream_response
-        # already returned saving the partial: leave the tool loop without
-        # re-invoking the model.
+        # Se l'utente ha premuto Ctrl+C durante lo stream, stream_response e
+        # gia rientrato salvando il parziale: usciamo dal loop tool senza
+        # provare a rilanciare il modello.
         if _cancel_event.is_set():
             break
 
         if msg['tool_calls']:
-            consecutive_continues = 0
+            no_action_strikes = 0   # tool call eseguita: reset contatore reasoning loop
             for tc in msg['tool_calls']:
                 fn = tc.get('function', {})
-                if fn.get('name') == 'run_shell':
-                    args = fn.get('arguments', {})
-                    cmd_arg = args.get('command', '') if isinstance(args, dict) else ''
-                    output = run_shell(cmd_arg)
-                    messages.append({"role": "tool", "content": output})
+                name = fn.get('name')
+                args = fn.get('arguments', {}) if isinstance(fn.get('arguments'), dict) else {}
+                if name == 'run_shell':
+                    output = run_shell(args.get('command', ''))
+                elif name == 'web_search':
+                    output = run_web_search(args.get('query', ''))
+                elif name == 'workspace_write':
+                    output = run_workspace_write(
+                        args.get('file', ''),
+                        args.get('content', ''),
+                        args.get('mode', 'append')
+                    )
+                elif name == 'workspace_read':
+                    output = run_workspace_read(args.get('file', ''))
+                else:
+                    output = f"Tool sconosciuto: {name}"
+                messages.append({"role": "tool", "content": output})
+            continue
+        elif (not msg.get('tool_calls')
+              and not (msg.get('content') or '').strip()
+              and len((msg.get('thinking') or '').split()) > 150
+              and msg.get('done_reason') != 'length'):
+            # Turno terminato NORMALMENTE (done_reason='stop') con SOLO thinking
+            # e zero azioni: il modello e' in reasoning loop silenzioso.
+            # Questo era il buco del detector precedente (scattava solo su 'length').
+            # I turni done_reason='length' con thinking-only vanno al branch successivo
+            # che gestisce anche la crescita del context prima di reinvocare.
+            thinking_words = len((msg.get('thinking') or '').split())
+            no_action_strikes += 1
+            if no_action_strikes >= 3:
+                print(f"\n  {c(f'⚠ reasoning loop [{no_action_strikes}/3] — interruzione forzata', YELLOW)}\n")
+                no_action_strikes = 0
+                break
+            _ESCALATION = [
+                (
+                    "ATTENZIONE: hai ragionato {w} parole senza eseguire nulla [{s}/3]. "
+                    "CONTRATTO OBBLIGATORIO: ogni turno deve produrre una tool call o una risposta finale. "
+                    "Esegui SUBITO run_shell o web_search. Quale azione fisica esegui adesso?"
+                ),
+                (
+                    "SECONDO AVVISO — REASONING LOOP [{s}/3]: {w} parole di thinking, zero azioni. "
+                    "BLOCCO AUTOMATICO AL PROSSIMO TURNO INATTIVO. "
+                    "Smetti di ragionare. Lancia ADESSO la tool call piu' probabile. "
+                    "Se hai 2+ opzioni, scegli la prima e basta — l'output ti dira' se era giusta."
+                ),
+            ]
+            template = _ESCALATION[min(no_action_strikes - 1, len(_ESCALATION) - 1)]
+            reminder = template.format(w=thinking_words, s=no_action_strikes)
+            print(f"\n  {c(f'⚠ reasoning loop [{no_action_strikes}/3] — {thinking_words} parole senza azione', YELLOW)}\n")
+            messages.append({"role": "user", "content": reminder})
             continue
         elif msg.get('done_reason') == 'length' and stats['auto_continue']:
-            consecutive_continues += 1
-            if consecutive_continues >= 2:
-                print(f"\n  {c('⚠ too many consecutive continues — compressing before moving on...', YELLOW)}")
+            length_retries += 1
+            # Safety hard-cap TOTALE (non resettato dalla compressione):
+            # se dopo 4 tentativi siamo ancora bloccati sul length, meglio
+            # fermarsi che loopare a vuoto compress-continue-compress.
+            if length_retries > 4:
+                print(f"\n  {c('⚠ auto-continue interrotto: 4 tentativi non hanno sbloccato il turno', YELLOW)}")
+                print(f"  {c('   prova /compress o /ac per disattivare', DIM)}\n")
+                break
+            # Il modello ha esaurito lo spazio nel num_ctx. Riprovare con lo
+            # STESSO num_ctx (che era gia' saturo) e' inutile: nel migliore
+            # dei casi Ollama ritorna subito un altro done_reason=length,
+            # nel peggiore si pianta a rimasticare il prompt pieno con la
+            # KV cache satura. Prima di appendere "continua" devo liberare
+            # spazio: se c'e' headroom sotto MAX_CTX cresco il tier
+            # (economico), altrimenti comprimo.
+            new_ctx = loki_hw.next_working_ctx(stats['working_ctx'], MAX_CTX)
+            if new_ctx > stats['working_ctx']:
+                old = stats['working_ctx']
+                stats['working_ctx'] = new_ctx
+                print(f"\n  {c(f'↗ ctx working esteso: {old} -> {new_ctx} tk (limite raggiunto)', GRAY)}")
+            else:
+                print(f"\n  {c('⚠ ctx al tetto del modello — comprimo prima di continuare...', YELLOW)}")
                 state['messages'] = compress_context(messages)
                 messages = state['messages']
-                consecutive_continues = 0
-            print(f"  {c('↻ token limit reached — continuing...', GRAY)}\n")
-            messages.append({"role": "user", "content": build_continue_message(msg)})
+            print(f"  {c('↻ limite token raggiunto — continuo...', GRAY)}\n")
+            # Se il thinking e' lungo ma non ci sono tool call, il modello e'
+            # in loop mentale. Inietta un reminder urgente nel contesto.
+            thinking_len = len((msg.get('thinking') or '').split())
+            no_action = not msg.get('tool_calls') and not (msg.get('content') or '').strip()
+            if thinking_len > 150 and no_action:
+                no_action_strikes += 1
+                reminder = (
+                    f"REASONING LOOP RILEVATO [{no_action_strikes}]: il tuo thinking e' stato"
+                    f" troncato dopo {thinking_len} parole ed e' andato perso per sempre."
+                    " REGOLA ASSOLUTA: smetti di ragionare e lancia SUBITO un tool call."
+                    " Anche solo `echo 'CHECKPOINT: [stato attuale in una riga]'`."
+                    " L'output di un comando fallito vale piu' di qualsiasi ragionamento."
+                )
+                messages.append({"role": "user", "content": reminder})
+            else:
+                messages.append({"role": "user", "content": build_continue_message(msg)})
             continue
         else:
-            consecutive_continues = 0
-            # Adaptive policy: when the prompt exceeds 80% of the current
-            # working_ctx, first try to extend the tier (cheaper than
-            # compressing). If working_ctx is already at the model ceiling,
-            # we compress. Either way Ollama is called with the updated
-            # `num_ctx` on the next turn.
+            # Politica adattiva: quando il prompt supera l'80% del working_ctx
+            # corrente, prima proviamo a estendere il tier (economico rispetto
+            # a comprimere). Se working_ctx e' gia' al tetto del modello,
+            # comprimiamo. In entrambi i casi Ollama viene richiamato con
+            # `num_ctx` aggiornato al turno successivo.
             if stats['ctx_used'] >= int(stats['working_ctx'] * COMPRESS_AT):
                 new_ctx = loki_hw.next_working_ctx(stats['working_ctx'], MAX_CTX)
                 if new_ctx > stats['working_ctx']:
                     old = stats['working_ctx']
                     stats['working_ctx'] = new_ctx
-                    print(f"\n  {c(f'↗ working ctx extended: {old} -> {new_ctx} tk', GRAY)}\n")
+                    print(f"\n  {c(f'↗ ctx working esteso: {old} -> {new_ctx} tk', GRAY)}\n")
                 else:
                     pct  = int(100 * stats['ctx_used'] / MAX_CTX)
                     used = stats['ctx_used']
-                    msg_txt = f"⚠ context at {pct}% ({used}/{MAX_CTX} tk) — compressing automatically..."
+                    msg_txt = f"⚠ context al {pct}% ({used}/{MAX_CTX} tk) — comprimo automaticamente..."
                     print(f"\n  {c(msg_txt, YELLOW)}")
                     state['messages'] = compress_context(messages)
                     messages = state['messages']
             break
 
-    # Autosave after every completed (or interrupted) turn: the user must
-    # not lose a long session because of a terminal or Ollama crash.
+    # Autosave dopo ogni turno completato (o interrotto): l'utente non deve
+    # perdere una sessione lunga per un crash del terminale o di Ollama.
     try:
         loki_persist.autosave_session(state['messages'], MODEL, SESSIONS_DIR)
     except Exception:
@@ -1578,7 +1921,7 @@ def _run_turn(state):
 
 
 def _handle_slash(text, state):
-    """Handle slash commands in async mode. Returns True to signal exit."""
+    """Gestisce i comandi slash in modalita async. Ritorna True se va uscito."""
     action, payload = parse_slash(text, state['messages'])
     if action == 'exit':
         return True
@@ -1588,8 +1931,8 @@ def _handle_slash(text, state):
         welcome()
         return False
     if action == 'resume':
-        # resume_session already cleared the output and reprinted banner + history,
-        # so we do NOT call welcome() here.
+        # resume_session ha gia pulito l'output e stampato banner + storia,
+        # quindi NON chiamiamo welcome() qui.
         state['messages'] = payload
         stats['pending_images'].clear()
         return False
@@ -1599,19 +1942,19 @@ def _handle_slash(text, state):
     if action == 'picker':
         _picker_activate(state)
         return False
-    return False  # 'handled' and others: output already printed by parse_slash
+    return False  # 'handled' e altri: output gia stampato da parse_slash
 
 
 async def _process_input(text, state):
-    """Async task that processes a single user submission."""
+    """Task async che processa una singola submission dell'utente."""
     if state['processing']:
         return
-    _cancel_event.clear()   # new turn: restart
-    _bashing_event.clear()  # spinner restarts as "cooking..."
+    _cancel_event.clear()   # nuovo turno: si riparte
+    _bashing_event.clear()  # spinner riparte da "cooking..."
     state['processing']   = True
     state['current_task'] = asyncio.current_task()
     try:
-        # Echo the input into the output area
+        # Echo dell'input nell'output area
         first, *rest = text.splitlines()
         print(f"\n  {ORANGE}❯{R} {first}")
         for line in rest:
@@ -1630,7 +1973,7 @@ async def _process_input(text, state):
         if stats['pending_images']:
             n_imgs = len(stats['pending_images'])
             message["images"] = stats['pending_images'][:]
-            print(f"  {c(f'[{n_imgs} image(s) attached]', DIM)}")
+            print(f"  {c(f'[{n_imgs} immagine/i allegate]', DIM)}")
             stats['pending_images'].clear()
         state['messages'].append(message)
 
@@ -1639,15 +1982,15 @@ async def _process_input(text, state):
         try:
             await turn_fut
         except asyncio.CancelledError:
-            # Ctrl+C canceled the outer task. The executor thread however
-            # keeps running (Python cannot kill threads). Give it 2s to
-            # notice _cancel_event, then free the prompt regardless.
+            # Ctrl+C ha cancellato il task esterno. Il thread executor pero
+            # continua a girare (Python non li puo killare). Diamogli 2s per
+            # notare _cancel_event, poi liberiamo il prompt comunque.
             _cancel_event.set()
             try:
                 await asyncio.wait_for(asyncio.shield(turn_fut), timeout=2.0)
-                print(c("  ✓ turn cleanly interrupted", GREEN))
+                print(c("  ✓ turno interrotto pulito", GREEN))
             except asyncio.TimeoutError:
-                print(c("  ⚠ turn still running in background — prompt freed anyway", RED))
+                print(c("  ⚠ turno ancora attivo in background — prompt libero comunque", RED))
             except Exception:
                 pass
     finally:
@@ -1656,10 +1999,10 @@ async def _process_input(text, state):
 
 
 async def async_chat_loop():
-    """Main loop in 'pinned' mode: a single prompt_async living for the whole
-    session, where Enter processes in-place instead of returning from the
-    prompt. patch_stdout(raw=True) makes the streaming appear above the input
-    line, with the input box and toolbar always at the bottom.
+    """Loop principale in modalita 'pinned': un solo prompt_async che vive per
+    tutta la sessione, con Enter che processa in-place invece di far ritornare
+    il prompt. patch_stdout(raw=True) fa apparire lo streaming sopra la riga
+    di input, e riquadro+toolbar restano sempre in fondo.
     """
     global _MAIN_LOOP, _PINNED_MODE
     _MAIN_LOOP    = asyncio.get_running_loop()
@@ -1672,15 +2015,15 @@ async def async_chat_loop():
     }
 
     def on_submit(text):
-        # Sync callback from the Enter handler in build_session.
-        # Schedules processing on the main loop.
+        # Callback sincrono dall'Enter handler di build_session.
+        # Schedula il processing sul loop principale.
         if state['processing']:
             return
         _MAIN_LOOP.create_task(_process_input(text, state))
 
     session = build_session(on_submit=on_submit)
 
-    # Add Ctrl+C / Ctrl+D to the keybindings already built inside build_session.
+    # Aggiungiamo Ctrl+C / Ctrl+D al set di keybindings gia costruiti dentro build_session.
     kb = session.key_bindings
 
     @kb.add('c-c')
@@ -1691,16 +2034,16 @@ async def async_chat_loop():
             return
         now = time.time()
         if state['processing']:
-            # Interrupt the current turn. stream_response checks
-            # _cancel_event between chunks and saves the partial.
+            # Interrompiamo il turno corrente. stream_response controlla
+            # _cancel_event tra un chunk e l'altro e salva il parziale.
             _cancel_event.set()
-            print(c("\n  ⚠ interruption requested...", YELLOW))
+            print(c("\n  ⚠ interruzione richiesta...", YELLOW))
             return
         if now - state['ctrl_c_ts'] <= 1.0:
             event.app.exit()
             return
         state['ctrl_c_ts'] = now
-        print(c("  press Ctrl+C again to exit", GRAY))
+        print(c("  premi ancora Ctrl+C per uscire", GRAY))
 
     @kb.add('c-d')
     def _(event):
@@ -1710,8 +2053,8 @@ async def async_chat_loop():
     welcome()
 
     def get_prompt():
-        # Continuous separator above the input box, recomputed on each
-        # render so it adapts to terminal resizes.
+        # separatore continuo sopra il riquadro di input, ricalcolato ad ogni
+        # render cosi si adatta ai resize del terminale.
         w = max(20, term_width())
         return ANSI(f"{DGRAY}{'─' * w}{R}\n  {ORANGE}❯{R} ")
 
@@ -1721,11 +2064,11 @@ async def async_chat_loop():
         except (EOFError, KeyboardInterrupt):
             pass
 
-    print(c("\n  Goodbye.\n", DIM))
+    print(c("\n  Arrivederci.\n", DIM))
 
 
 def _make_toolbar_fs():
-    """Toolbar for fullscreen mode (analog of bottom_toolbar in build_session)."""
+    """Toolbar per modalita full-screen (analoga a bottom_toolbar in build_session)."""
     elapsed = datetime.now() - stats['start_time']
     mins    = int(elapsed.total_seconds() // 60)
     secs    = int(elapsed.total_seconds() % 60)
@@ -1742,7 +2085,7 @@ def _make_toolbar_fs():
         ctx = f"  {ctx_col}ctx {pct}%{R}"
     else:
         ctx = ''
-    mouse_hint  = '' if _mouse_enabled[0] else f"  {YELLOW}✂ selection{R}"
+    mouse_hint  = '' if _mouse_enabled[0] else f"  {YELLOW}✂ selezione{R}"
     model_short = MODEL.split('/')[-1][:28]
     content = (
         f"  {mode}{sep}"
@@ -1754,8 +2097,8 @@ def _make_toolbar_fs():
         f"{tk}{ctx}{imgs}{mouse_hint}{sep}"
         f"{think}  {ac}  "
     )
-    # Right-pad to the end of the terminal so the toolbar's dark background
-    # covers the full width (without padding the right side stays transparent/inconsistent).
+    # Pad a fine terminale cosi lo sfondo scuro della toolbar copre tutta la
+    # larghezza (senza padding, la parte a destra resta trasparente/incoerente).
     plain_len = len(strip_ansi(content))
     w = term_width()
     if plain_len < w:
@@ -1764,11 +2107,11 @@ def _make_toolbar_fs():
 
 
 async def async_chat_loop_fullscreen():
-    """Fullscreen loop: Application with an HSplit Layout of 4 zones.
-    The output area scrolls with the mouse wheel (via _ScrollableOutputControl),
-    the input box is pinned at the bottom, and the toolbar sits below.
+    """Loop in modalita full-screen: Application con Layout HSplit di 4 zone.
+    Output area scrolla con la rotella (grazie a _ScrollableOutputControl),
+    riquadro input pinnato in basso, toolbar sotto.
 
-    On error, restores stdout and writes a traceback to ~/loki_debug.log.
+    Su errore, restaura stdout e scrive traceback su ~/loki_debug.log.
     """
     global _MAIN_LOOP, _PINNED_MODE, _app_ref
     _MAIN_LOOP        = asyncio.get_running_loop()
@@ -1784,11 +2127,11 @@ async def async_chat_loop_fullscreen():
 
     _saved_stdout = sys.stdout
 
-    # ----- BUILD THE LAYOUT BEFORE redirecting stdout -----
-    # If something blows up here, the error goes to the real terminal, not into the void.
+    # ----- COSTRUISCI LA LAYOUT PRIMA di redirigere stdout -----
+    # Se qualcosa esplode qui, l'errore va sul terminale vero, non nell'oblio.
     try:
-        # Output area (with wheel handler). Top-aligned, no padding: the banner
-        # sits at the top and messages flow underneath as they arrive.
+        # Output area (con handler rotella). Top-aligned, no padding: il banner
+        # sta in alto e i messaggi scorrono sotto man mano che arrivano.
         def _get_output_ft():
             if _picker['active']:
                 try:
@@ -1796,9 +2139,9 @@ async def async_chat_loop_fullscreen():
                     _output_line_count[0] = rendered.count('\n') + 1
                     return ANSI(rendered)
                 except Exception as e:
-                    _debug_log(f"_picker_render ERROR: {e}")
+                    _debug_log(f"_picker_render ERRORE: {e}")
                     _output_line_count[0] = 1
-                    return ANSI(f"  {RED}Picker error: {e}{R}")
+                    return ANSI(f"  {RED}Errore picker: {e}{R}")
             with _output_lock:
                 text = ''.join(_output_chunks) or ' '
             _output_line_count[0] = text.count('\n') + 1
@@ -1838,10 +2181,10 @@ async def async_chat_loop_fullscreen():
         )
         _output_window_ref[0] = output_window
 
-        # Spinner "cooking..." / "bashing..." — visible only while
-        # state['processing'] is True. Frames cycle ~6 times per second.
-        # Becomes "bashing..." when _bashing_event is set, i.e. when the
-        # model is emitting tool_calls or when run_shell is running.
+        # Spinner "cooking..." / "bashing..." — visibile solo mentre
+        # state['processing'] e True. I frame ciclano ~6 volte al secondo.
+        # Diventa "bashing..." quando _bashing_event e' set, cioe' quando il
+        # modello sta emettendo tool_calls o quando run_shell sta girando.
         SPINNER_FRAMES = ['·', '✶', '✽', '✶', '·']
         def _get_spinner_ft():
             idx = int(time.time() * 6) % len(SPINNER_FRAMES)
@@ -1856,9 +2199,9 @@ async def async_chat_loop_fullscreen():
             filter=Condition(lambda: state['processing']),
         )
 
-        # Separator
+        # Separatore
         def _get_sep_ft():
-            # GRAY instead of DGRAY: DGRAY was invisible on dark themes.
+            # GRAY invece di DGRAY: DGRAY su tema scuro spariva.
             return ANSI(f"{GRAY}{'─' * max(20, term_width())}{R}")
 
         separator = Window(
@@ -1866,9 +2209,9 @@ async def async_chat_loop_fullscreen():
             height=1,
         )
 
-        # Input area (Buffer + BufferControl with BeforeInput for the "❯")
-        # read_only when the picker is active (except in clone_input): prevents
-        # character insertion in the buffer without needing an <any> catch-all.
+        # Input area (Buffer + BufferControl con BeforeInput per il "❯")
+        # read_only quando il picker e attivo (non in clone_input): impedisce
+        # l'inserimento di caratteri nel buffer senza bisogno di <any> catch-all.
         _buf_readonly = Condition(
             lambda: _picker['active'] and _picker['mode'] != 'clone_input'
         )
@@ -1881,7 +2224,7 @@ async def async_chat_loop_fullscreen():
             read_only=_buf_readonly,
         )
 
-        # Enter handler local to the buffer
+        # Enter handler locale al buffer
         kb_input = KeyBindings()
 
         def on_submit(text):
@@ -1889,17 +2232,17 @@ async def async_chat_loop_fullscreen():
                 return
             _MAIN_LOOP.create_task(_process_input(text, state))
 
-        # eager=True: Enter is consumed immediately, without first handing
-        # off to the autocomplete menu (which would otherwise "accept the
-        # completion" instead of submitting — the /help bug).
-        # filter=not picker: when the picker is active this binding must not
-        # match, otherwise it wins over _p_enter (kb_app comes first in the
-        # match list and matches[-1] is always the control-level).
+        # eager=True: Enter viene consumato subito, senza dare prima la mano al
+        # menu autocomplete (che altrimenti "accetta la completion" e non
+        # submitta — bug del /help).
+        # filter=not picker: quando il picker e attivo questo binding non deve
+        # matchare, altrimenti vince su _p_enter (kb_app viene prima nella lista
+        # di match e matches[-1] e sempre il control-level).
         _not_picker_cond = Condition(lambda: not _picker['active'])
         @kb_input.add('enter', eager=True, filter=_not_picker_cond)
         def _(event):
             buf = event.current_buffer
-            # If an autocomplete menu is open, close it before continuing.
+            # Se c'e un menu autocomplete aperto, chiudilo prima di procedere.
             if buf.complete_state is not None:
                 buf.complete_state = None
             if buf.text.endswith('\\'):
@@ -1919,9 +2262,9 @@ async def async_chat_loop_fullscreen():
             key_bindings=kb_input,
             focusable=True,
         )
-        # dont_extend_height=True: the Window adapts to the real content of
-        # the buffer. Empty buffer = 1 line, grows up to max=8 for multiline
-        # input (with \+Enter).
+        # dont_extend_height=True: il Window si adatta al contenuto reale del
+        # buffer. Con buffer vuoto = 1 riga, cresce fino a max=8 se scrivi
+        # multiline (con \+Invio).
         input_window = Window(
             content=input_control,
             height=Dimension(min=1, max=8),
@@ -1936,7 +2279,7 @@ async def async_chat_loop_fullscreen():
             style='class:toolbar',
         )
 
-        # App-level keybindings (Ctrl+C, Ctrl+D, PageUp/PageDown for keyboard scroll)
+        # Keybindings app-level (Ctrl+C, Ctrl+D, PageUp/PageDown per scroll da tastiera)
         kb_app = KeyBindings()
 
         @kb_app.add('c-c')
@@ -1947,22 +2290,21 @@ async def async_chat_loop_fullscreen():
                 return
             now = time.time()
             if state['processing']:
-                # Signal cancel to the thread (checked between chunks). Also
-                # cancel the outer async task: _process_input will catch
-                # CancelledError, wait 2s for the thread to release, and free
-                # 'processing' anyway so the prompt is available even if the
-                # thread is stuck.
+                # Segnala il cancel al thread (check tra chunk). In piu, cancella
+                # il task async esterno: _process_input catchera CancelledError,
+                # aspettera 2s che il thread rilasci, e comunque liberera 'processing'
+                # cosi il prompt torna disponibile anche se il thread e appeso.
                 _cancel_event.set()
                 task = state.get('current_task')
                 if task is not None and not task.done():
                     task.cancel()
-                print(c("\n  ⚠ interruption requested...", YELLOW))
+                print(c("\n  ⚠ interruzione richiesta...", YELLOW))
                 return
             if now - state['ctrl_c_ts'] <= 1.0:
                 event.app.exit()
                 return
             state['ctrl_c_ts'] = now
-            print(c("  press Ctrl+C again to exit", GRAY))
+            print(c("  premi ancora Ctrl+C per uscire", GRAY))
 
         @kb_app.add('c-d')
         def _(event):
@@ -1977,7 +2319,7 @@ async def async_chat_loop_fullscreen():
         def _(event):
             _scroll_down(10)
 
-        # End = jump to bottom; Home = jump to top of content
+        # End = salta al fondo; Home = salta all'inizio del contenuto
         @kb_app.add('end')
         def _(event):
             _scroll_to_bottom()
@@ -1988,17 +2330,17 @@ async def async_chat_loop_fullscreen():
             _scroll_lines[0]  = 0
             event.app.invalidate()
 
-        # Alt+M: toggle mouse capture (for copy/paste with the mouse)
+        # Alt+M: toggle mouse capture (per copiare/incollare col mouse)
         @kb_app.add('escape', 'm')
         def _(event):
             _mouse_enabled[0] = not _mouse_enabled[0]
             new_state = 'ON' if _mouse_enabled[0] else 'OFF'
-            hint = 'wheel scroll active' if _mouse_enabled[0] else 'you can now select with the mouse'
+            hint = 'rotella scroll attiva' if _mouse_enabled[0] else 'ora puoi selezionare col mouse'
             col  = GREEN if _mouse_enabled[0] else GRAY
             print(f"  {c(f'mouse: {new_state}', col)}  {c(hint, DIM)}")
             event.app.invalidate()
 
-        # ── History navigation (↑↓ outside the picker) ──────────────────────────
+        # ── History navigation (↑↓ fuori dal picker) ──────────────────────────
         @kb_input.add('up', filter=_not_picker_cond, eager=True)
         def _hist_up(event):
             buf = event.current_buffer
@@ -2063,7 +2405,7 @@ async def async_chat_loop_fullscreen():
                     _picker['mode'] = 'actions'
                     _picker['action'] = 0
             elif mode == 'clone_input':
-                pass  # handled by backspace
+                pass  # gestito da backspace
             event.app.invalidate()
 
         @kb_input.add('escape', filter=_picker_cond, eager=True)
@@ -2075,10 +2417,10 @@ async def async_chat_loop_fullscreen():
                 _picker['mode'] = 'list'
                 event.app.invalidate()
             elif mode == 'clone_input':
-                # Cancel clone: empty the buffer and go back to actions
+                # Annulla clone: svuota il buffer e torna alle azioni
                 event.current_buffer.reset()
                 _picker['mode']   = 'actions'
-                _picker['action'] = 1  # clone was action=1
+                _picker['action'] = 1  # clone era action=1
                 event.app.invalidate()
             elif mode == 'delete_confirm':
                 _picker['mode']   = 'actions'
@@ -2103,8 +2445,8 @@ async def async_chat_loop_fullscreen():
                     _picker['action'] = 1   # default: Annulla
                     event.app.invalidate()
                 else:
-                    # Enter clone_input: set the mode BEFORE touching the buffer
-                    # (so _buf_readonly becomes False and insert_text works).
+                    # Entra in clone_input: setta il mode PRIMA di toccare il buffer
+                    # (cosi _buf_readonly diventa False e insert_text funziona).
                     _picker['mode'] = 'clone_input'
                     buf = event.current_buffer
                     buf.reset()
@@ -2122,7 +2464,7 @@ async def async_chat_loop_fullscreen():
                     _picker['mode'] = 'list'
                 event.app.invalidate()
             elif mode == 'clone_input':
-                # Read the name from the input buffer (where the user typed)
+                # Legge il nome dal buffer di input (dove l'utente ha scritto)
                 new_name = event.current_buffer.text.strip()
                 event.current_buffer.reset()
                 if new_name:
@@ -2134,19 +2476,19 @@ async def async_chat_loop_fullscreen():
                 _picker['mode'] = 'list'
                 event.app.invalidate()
 
-        # ── End picker key bindings ────────────────────────────────────────────
-        # Note: no <any> catch-all — the buffer has read_only=_buf_readonly
-        # which blocks text insertion in list/actions/delete_confirm modes.
-        # In clone_input the buffer is editable and characters flow directly
-        # into the buffer (which we read to get the final name in _p_enter).
+        # ── Fine picker key bindings ───────────────────────────────────────────
+        # Nota: nessun <any> catch-all — il buffer ha read_only=_buf_readonly
+        # che blocca l'inserimento di testo nelle modalita list/actions/delete_confirm.
+        # In clone_input il buffer è editabile e i caratteri vanno direttamente
+        # nel buffer (che usiamo per leggere il nome finale in _p_enter).
 
-        # FloatContainer for the autocomplete menu: appears above the input as
-        # a popup anchored to the cursor while typing "/..."
+        # FloatContainer per il menu autocomplete: appare sopra l'input come
+        # popup ancorato al cursore quando si digita "/..."
         body = HSplit([
             output_window,
-            spinner_container,   # visible only while Loki is working
+            spinner_container,   # visibile solo mentre Loki lavora
             separator,
-            input_window,        # 1 line by default, grows for multiline
+            input_window,        # 1 riga di default, cresce col multiline
             toolbar_window,
         ])
         root_container = FloatContainer(
@@ -2166,9 +2508,8 @@ async def async_chat_loop_fullscreen():
             'toolbar': 'bg:#0e0e0e fg:#ffffff bold',
         })
 
-        # Condition tied to the mutable flag: at render time prompt_toolkit
-        # re-reads it and enables/disables terminal mouse tracking (emits
-        # the 1000/1006 escape sequences).
+        # Condition legata al flag mutabile: al render prompt_toolkit rilegge
+        # e attiva/disattiva mouse tracking sul terminale (invia le escape 1000/1006).
         mouse_cond = Condition(lambda: _mouse_enabled[0])
 
         app = Application(
@@ -2176,11 +2517,11 @@ async def async_chat_loop_fullscreen():
             key_bindings=kb_app,
             full_screen=True,
             style=app_style,
-            refresh_interval=0.15,  # cadence for animating the "cooking..." spinner
+            refresh_interval=0.15,  # cadenza per far animare lo spinner "cooking..."
             mouse_support=mouse_cond,
         )
 
-        # Override _handle_exception to log the full traceback
+        # Sovrascrivi _handle_exception per loggare il traceback completo
         _orig_handle_exc = app._handle_exception
         def _logged_handle_exc(loop, context):
             import traceback as _tb
@@ -2203,7 +2544,7 @@ async def async_chat_loop_fullscreen():
     _app_ref     = app
 
     try:
-        welcome()  # writes into _output_chunks via redirect
+        welcome()  # scrive nel _output_chunks via redirect
         _debug_log("about to app.run_async()")
         await app.run_async()
         _debug_log("app.run_async returned normally")
@@ -2216,17 +2557,17 @@ async def async_chat_loop_fullscreen():
         sys.stdout = _saved_stdout
         _PINNED_MODE = False
 
-    print(c("\n  Goodbye.\n", DIM))
+    print(c("\n  Arrivederci.\n", DIM))
 
 
 if __name__ == "__main__":
     detect_max_ctx()
-    # HW probe + choice of the initial working_ctx: we start small (default 8-16k)
-    # instead of allocating KV cache for the whole MAX_CTX. If needed, _run_turn
-    # bumps to the next tier when the prompt exceeds 80%.
+    # Probe HW e scelta del working_ctx iniziale: partiamo piccolo (default 8-16k)
+    # invece di allocare KV cache per l'intero MAX_CTX. Se serve, _run_turn
+    # bumpa al tier successivo quando il prompt supera l'80%.
     HW = loki_hw.detect_hardware()
     stats['working_ctx'] = loki_hw.initial_working_ctx(MAX_CTX, HW['ram_avail_gb'])
-    # One-off cleanup of very old sessions (skip _autosave and other _*).
+    # Pulizia una tantum di sessioni molto vecchie (skip _autosave e altri _*).
     try:
         loki_persist.prune_old_sessions(SESSIONS_DIR)
     except Exception:
@@ -2242,16 +2583,16 @@ if __name__ == "__main__":
                 asyncio.run(async_chat_loop_fullscreen())
             except Exception as e:
                 import traceback
-                sys.stderr.write(f"\n\n❌ Fullscreen mode error: {e}\n")
-                sys.stderr.write("Traceback also at ~/loki_debug.log\n")
-                sys.stderr.write("Classic fallback: LOKI_UI=classic ./loki.sh\n\n")
+                sys.stderr.write(f"\n\n❌ Errore in modalita full-screen: {e}\n")
+                sys.stderr.write("Traceback anche su ~/loki_debug.log\n")
+                sys.stderr.write("Fallback classico: LOKI_UI=classic ./loki.sh\n\n")
                 traceback.print_exc()
                 exit_code = 1
     except KeyboardInterrupt:
-        # Ctrl+C during asyncio shutdown (waits for executor threads up to
-        # THREAD_JOIN_TIMEOUT). If a model turn is stuck inside Ollama the
-        # thread will never finish — we exit hard with os._exit and skip the join.
+        # Ctrl+C durante lo shutdown asyncio (aspetta i thread executor per
+        # THREAD_JOIN_TIMEOUT). Se un turno modello e' impuntato in Ollama il
+        # thread non finira mai — usciamo hard con os._exit e skippiamo il join.
         pass
-    # os._exit skips the clean asyncio shutdown: prompt_toolkit has already
-    # restored the terminal before returning, so this is safe.
+    # os._exit salta la chiusura pulita asyncio: prompt_toolkit ha gia
+    # ripristinato il terminale prima di ritornare, quindi e sicuro.
     os._exit(exit_code)

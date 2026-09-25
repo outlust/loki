@@ -150,7 +150,7 @@ step "4/9 · Prepare $LOKI_HOME and copy files"
 # ═══════════════════════════════════════════════════════════════════════
 mkdir -p "$LOKI_HOME"
 
-PY_FILES=(loki.py loki_hw.py loki_persist.py loki_mem.py loki_sec.py)
+PY_FILES=(loki.py loki_hw.py loki_persist.py loki_mem.py loki_sec.py loki_web.py)
 # install.sh and uninstall.sh also land in LOKI_HOME so the user can
 # reinstall/uninstall later without keeping the original bundle around.
 AUX_FILES=(install.sh uninstall.sh requirements.txt)

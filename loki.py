@@ -175,6 +175,8 @@ SLASH_COMMANDS = {
     '/quit':     'alias of /exit',
 }
 
+_web_confirm_fn = None   # set by loki_web.run() when LOKI_UI=web
+
 stats = {
     'start_time':    datetime.now(),
     'messages':      0,
@@ -832,6 +834,9 @@ def confirm_command(command):
         print()
         print(f"  {c('⏺', GREEN)} {c('Bash', BOLD)}  {c(command, CYAN)}  {c('[auto]', DIM)}")
         return True
+
+    if _web_confirm_fn is not None:
+        return _web_confirm_fn(command)
 
     app = get_app_or_none()
     if app is None or _MAIN_LOOP is None:
@@ -3228,7 +3233,12 @@ if __name__ == "__main__":
     ui_mode   = os.environ.get('LOKI_UI', 'fullscreen').lower()
     exit_code = 0
     try:
-        if ui_mode == 'classic':
+        if ui_mode == 'web':
+            import loki_web
+            _port = int(os.environ.get('LOKI_PORT', '8080'))
+            _state = {'messages': [{"role": "system", "content": build_system_prompt()}]}
+            loki_web.run(_state, port=_port)
+        elif ui_mode == 'classic':
             asyncio.run(async_chat_loop())
         else:
             try:

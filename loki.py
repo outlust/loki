@@ -2287,34 +2287,46 @@ def _run_turn(state):
             continue
         elif (not msg.get('tool_calls')
               and not (msg.get('content') or '').strip()
-              and len((msg.get('thinking') or '').split()) > 150
+              and len((msg.get('thinking') or '').split()) > 80
               and msg.get('done_reason') != 'length'):
-            # Turn ended NORMALLY (done_reason='stop') with ONLY thinking and zero actions:
-            # model is in a silent reasoning loop.
-            # Turns with done_reason='length' and thinking-only go to the next branch
-            # which also handles context growth before re-invoking.
+            # Turn ended normally with ONLY thinking and zero actions → reasoning loop.
+            # (done_reason=length + thinking-only goes to the length branch below)
             thinking_words = len((msg.get('thinking') or '').split())
+
+            # Strip thinking from the looping message immediately: it's already
+            # displayed, keeping it in context only wastes tokens.
+            messages[-1] = {k: v for k, v in messages[-1].items() if k != 'thinking'}
+
             no_action_strikes += 1
-            if no_action_strikes >= 3:
-                print(f"\n  {c(f'⚠ reasoning loop [{no_action_strikes}/3] — forced interruption', YELLOW)}\n")
-                no_action_strikes = 0
+            if no_action_strikes >= 2:
+                # Hard break: scrub loop artifacts from history so they don't
+                # accumulate. Walk back and remove silent-assistant turns and
+                # the injected user reminders that preceded them.
+                _clean_idx = len(messages) - 1
+                _LOOP_PREFIXES = ('STOP.', 'REASONING LOOP')
+                while _clean_idx > 1:
+                    m = messages[_clean_idx]
+                    is_silent_asst = (m.get('role') == 'assistant'
+                                      and not m.get('tool_calls')
+                                      and not (m.get('content') or '').strip())
+                    is_loop_reminder = (m.get('role') == 'user'
+                                        and any((m.get('content') or '').startswith(p)
+                                                for p in _LOOP_PREFIXES))
+                    if is_silent_asst or is_loop_reminder:
+                        _clean_idx -= 1
+                    else:
+                        break
+                messages[:] = messages[:_clean_idx + 1]
+                print(f"\n  {c(f'⚠ reasoning loop — break after 2 silent turns ({thinking_words} words)', YELLOW)}\n")
                 break
-            _ESCALATION = [
-                (
-                    "WARNING: you reasoned {w} words without executing anything [{s}/3]. "
-                    "MANDATORY CONTRACT: every turn must produce a tool call or a final response. "
-                    "Execute run_shell or web_search NOW. What physical action do you take now?"
-                ),
-                (
-                    "SECOND WARNING — REASONING LOOP [{s}/3]: {w} words of thinking, zero actions. "
-                    "AUTO-BLOCK ON NEXT INACTIVE TURN. "
-                    "Stop reasoning. Launch the most likely tool call NOW. "
-                    "If you have 2+ options, pick the first one — the output will tell you if it was right."
-                ),
-            ]
-            template = _ESCALATION[min(no_action_strikes - 1, len(_ESCALATION) - 1)]
-            reminder = template.format(w=thinking_words, s=no_action_strikes)
-            print(f"\n  {c(f'⚠ reasoning loop [{no_action_strikes}/3] — {thinking_words} words without action', YELLOW)}\n")
+
+            # Strike 1: minimal reminder, saves context vs long escalation message
+            reminder = (
+                f"STOP. {thinking_words} words of thinking, zero actions. "
+                "Call a tool NOW — run_shell, web_search or fetch_url. "
+                "Pick the most likely option and execute it. No more reasoning."
+            )
+            print(f"\n  {c(f'⚠ reasoning loop [1/2] — {thinking_words} words, no action', YELLOW)}\n")
             messages.append({"role": "user", "content": reminder})
             continue
         elif msg.get('done_reason') == 'length' and stats['auto_continue']:
@@ -2343,18 +2355,18 @@ def _run_turn(state):
                 state['messages'] = compress_context(messages)
                 messages = state['messages']
             print(f"  {c('↻ limite token raggiunto — continuo...', GRAY)}\n")
-            # Se il thinking e' lungo ma non ci sono tool call, il modello e'
-            # in loop mentale. Inietta un reminder urgente nel contesto.
+            # Thinking-only + done_reason=length: model was looping when ctx ran out.
+            # Strip the thinking blob before re-injecting (it's gone anyway — truncated).
             thinking_len = len((msg.get('thinking') or '').split())
             no_action = not msg.get('tool_calls') and not (msg.get('content') or '').strip()
-            if thinking_len > 150 and no_action:
+            if thinking_len > 80 and no_action:
+                # Strip thinking from the truncated message — it was cut off anyway,
+                # keeping it pollutes context with an incomplete blob.
+                messages[-1] = {k: v for k, v in messages[-1].items() if k != 'thinking'}
                 no_action_strikes += 1
                 reminder = (
-                    f"REASONING LOOP RILEVATO [{no_action_strikes}]: il tuo thinking e' stato"
-                    f" troncato dopo {thinking_len} parole ed e' andato perso per sempre."
-                    " REGOLA ASSOLUTA: smetti di ragionare e lancia SUBITO un tool call."
-                    " Anche solo `echo 'CHECKPOINT: [stato attuale in una riga]'`."
-                    " L'output di un comando fallito vale piu' di qualsiasi ragionamento."
+                    f"REASONING LOOP: thinking truncated after {thinking_len} words — lost forever. "
+                    "Call a tool NOW: run_shell, web_search or fetch_url. No more reasoning."
                 )
                 messages.append({"role": "user", "content": reminder})
             else:

@@ -168,6 +168,7 @@ SLASH_COMMANDS = {
     '/search':   'search saved sessions by keyword',
     '/delete':   'delete a saved session [name|number]',
     '/clone':    'clone a saved session   [source] [new_name]',
+    '/fetch':    'fetch a URL and show its content  [url]',
     '/hw':       'show detected HW (RAM, threads, GPU, working ctx)',
     '/trim':     'free memory now: strip thinking + truncate old tool outputs (no LLM)',
     '/exit':     'exit the shell agent',
@@ -247,9 +248,9 @@ tools_schema = [
         "function": {
             "name": "web_search",
             "description": (
-                "Search for information online (tool syntax, documentation, CVEs, workarounds). "
+                "Search for information online (tool syntax, documentation, CVEs, workarounds, recent events). "
                 "Use BEFORE guessing unknown options or flags, and when a command fails for unclear reasons. "
-                "Returns relevant text snippets."
+                "Returns instant answers + search snippets. Follow up with fetch_url to read a result in full."
             ),
             "parameters": {
                 "type": "object",
@@ -257,6 +258,24 @@ tools_schema = [
                     "query": {"type": "string", "description": "Search query in English or Italian"}
                 },
                 "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_url",
+            "description": (
+                "Fetch the full text content of a specific URL (documentation, CVE page, GitHub repo, "
+                "article, man page online, etc.). Use AFTER web_search to read a promising result in detail, "
+                "or when you already have a URL you need to inspect. Returns clean markdown text."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "Full URL to fetch (https://...)"}
+                },
+                "required": ["url"]
             }
         }
     },
@@ -914,40 +933,108 @@ def _maybe_sudo_apt(command):
     return command
 
 def run_web_search(query):
-    """Cerca online via Jina AI reader + DuckDuckGo Lite. Nessuna API key richiesta."""
+    """Multi-source web search: DDG instant answer API + DDG Lite via Jina reader."""
     import urllib.parse
+    import json as _json
     query = query.strip()
     if not query:
         return "Errore: query vuota"
     q = urllib.parse.quote_plus(query)
-    jina_url = f"https://r.jina.ai/https://lite.duckduckgo.com/lite/?q={q}"
-    cmd = f"curl -s --max-time 15 '{jina_url}'"
     print(f"  {c('web_search:', BLUE)} {query}")
+    results = []
+
+    # 1) DDG Instant Answer API — fast, structured, best for factual/tech queries
     try:
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=18)
+        ddg_api = f"https://api.duckduckgo.com/?q={q}&format=json&no_html=1&skip_disambig=1&t=loki"
+        r = subprocess.run(
+            f"curl -sL --max-time 8 '{ddg_api}'",
+            shell=True, capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            data = _json.loads(r.stdout)
+            section = []
+            if data.get('Answer'):
+                section.append(f"[INSTANT ANSWER] {data['Answer']}")
+            if data.get('AbstractText'):
+                section.append(f"[SUMMARY] {data['AbstractText']}")
+                if data.get('AbstractURL'):
+                    section.append(f"Source: {data['AbstractURL']}")
+            for topic in data.get('RelatedTopics', [])[:5]:
+                if isinstance(topic, dict) and topic.get('Text'):
+                    url = topic.get('FirstURL', '')
+                    line = f"• {topic['Text']}"
+                    if url:
+                        line += f"\n  → {url}"
+                    section.append(line)
+            if section:
+                results.append('\n'.join(section))
+    except Exception:
+        pass
+
+    # 2) DDG Lite via Jina reader — gets actual search snippets + titles
+    try:
+        jina_url = f"https://r.jina.ai/https://lite.duckduckgo.com/lite/?q={q}"
+        r = subprocess.run(
+            f"curl -sL --max-time 15 '{jina_url}'",
+            shell=True, capture_output=True, text=True, timeout=18,
+        )
+        text = r.stdout.strip()
+        if text:
+            _SKIP = ('duckduckgo.com/l/?uddg=', 'URL Source:', 'Title:',
+                     'Markdown Content:', 'Web Search', 'Safe Search',
+                     'Next Page', '---', '===')
+            lines = []
+            for line in text.splitlines():
+                line = line.strip()
+                if not line or len(line) < 16:
+                    continue
+                if any(s in line for s in _SKIP):
+                    continue
+                lines.append(line)
+            if lines:
+                results.append('[SEARCH RESULTS]\n' + '\n'.join(lines[:60]))
+    except Exception:
+        pass
+
+    if not results:
+        return f"Nessun risultato per: {query}"
+
+    combined = '\n\n'.join(results)
+    if len(combined) > 3500:
+        combined = (combined[:3500]
+                    + '\n[...troncato — usa fetch_url <url> per leggere una pagina completa]')
+    return combined
+
+
+def run_fetch_url(url):
+    """Fetch full text content of a URL via Jina AI reader. Returns clean markdown."""
+    url = url.strip().strip('"\'')
+    if not url.startswith('http'):
+        url = 'https://' + url
+    print(f"  {c('fetch_url:', BLUE)} {url}")
+    try:
+        jina_url = f"https://r.jina.ai/{url}"
+        r = subprocess.run(
+            f"curl -sL --max-time 20 '{jina_url}'",
+            shell=True, capture_output=True, text=True, timeout=25,
+        )
         text = r.stdout.strip()
         if not text:
-            return f"Nessun risultato per: {query}"
-        # Filtra righe utili: salta redirect DDG e header Jina
-        lines = []
-        for line in text.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            if any(skip in line for skip in ('duckduckgo.com/l/?uddg=', 'URL Source:', 'Title:', 'Markdown Content:')):
-                continue
-            if line in ('---', '===', '\\---'):
-                continue
-            if len(line) > 15:
-                lines.append(line)
-        result = '\n'.join(lines)
-        if len(result) > 2000:
-            result = result[:2000] + '\n[...troncato]'
-        return result if result.strip() else f"Nessun risultato utile per: {query}"
+            return f"Nessun contenuto da: {url}"
+        # Strip Jina metadata header lines
+        _META = ('URL Source:', 'Title:', 'Markdown Content:', 'Published Time:',
+                 'Description:', 'X-Frame-Options:', 'Content-Type:')
+        lines = [ln for ln in text.splitlines()
+                 if not any(ln.strip().startswith(m) for m in _META)]
+        result = '\n'.join(lines).strip()
+        if len(result) > 6000:
+            result = (result[:6000]
+                      + '\n[...troncato — specifica una sezione o usa read_file per file locali]')
+        return result if result else f"Contenuto vuoto da: {url}"
     except subprocess.TimeoutExpired:
-        return "TIMEOUT: web_search ha superato 18 secondi"
+        return f"TIMEOUT: fetch_url ha superato 20 secondi per {url}"
     except Exception as e:
-        return f"Errore web_search: {e}"
+        return f"Errore fetch_url: {e}"
 
 def run_workspace_write(file, content, mode):
     if file not in WORKSPACE_FILES:
@@ -1121,7 +1208,7 @@ def build_system_prompt():
         " or considering the same option 2+ times. This burns context window without producing real info."
         " Output from a failed command is worth more than 1000 tokens of prior reasoning."
         "\n\n**MANDATORY CONTRACT — every thinking turn MUST end with ONE of:**"
-        "\n  A) a tool call (run_shell, web_search, read_file, write_file, workspace_write/read, or a security tool)"
+        "\n  A) a tool call (run_shell, web_search, fetch_url, read_file, write_file, workspace_write/read, or a security tool)"
         "\n  B) a final text response to the user"
         "\nOption C does not exist (thinking without action). If about to choose C, choose A."
         "\n\n**TRIPWIRE — these conditions trigger an IMMEDIATE tool call, no further reasoning:**"
@@ -1790,6 +1877,14 @@ def parse_slash(text, messages=None):
                 print(f"    {c(snippet[:80], DGRAY)}")
             print(f"\n  {c('load one:', DIM)} {c('/resume <name>', ORANGE)}\n")
         return 'handled', None
+    if cmd == '/fetch':
+        url = arg.strip()
+        if not url:
+            print(c("  uso: /fetch <url>\n", GRAY))
+        else:
+            result = run_fetch_url(url)
+            print(f"\n{result}\n")
+        return 'handled', None
     if cmd == '/img':
         path = os.path.expanduser(arg.strip().strip('"\''))
         if os.path.isfile(path):
@@ -2167,6 +2262,8 @@ def _run_turn(state):
                     )
                 elif tool_name == 'web_search':
                     output = run_web_search(args.get('query', ''))
+                elif tool_name == 'fetch_url':
+                    output = run_fetch_url(args.get('url', ''))
                 elif tool_name == 'workspace_write':
                     output = run_workspace_write(
                         args.get('file', ''),
@@ -3024,6 +3121,12 @@ def run_oneshot(query, stdin_data=None, exec_cmd=None):
                     sys.stdout.write(f"\n\n[tool: {tn}]\n{out}\n")
                 elif tn == 'read_file':
                     out = run_read_file(args.get('path', ''))
+                    sys.stdout.write(f"\n\n[tool: {tn}]\n{out}\n")
+                elif tn == 'web_search':
+                    out = run_web_search(args.get('query', ''))
+                    sys.stdout.write(f"\n\n[tool: {tn}]\n{out}\n")
+                elif tn == 'fetch_url':
+                    out = run_fetch_url(args.get('url', ''))
                     sys.stdout.write(f"\n\n[tool: {tn}]\n{out}\n")
                 else:
                     sys.stdout.write(f"\n\n[tool: {tn} — not supported in one-shot mode]\n")

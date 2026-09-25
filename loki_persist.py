@@ -15,6 +15,7 @@ import time
 AUTOSAVE_NAME = '_autosave'
 AUTOSAVE_TTL_HOURS = 12
 SESSION_MAX_AGE_DAYS = 60
+AUTOSAVE_MIN_INTERVAL_S = 30  # don't write more often than this
 
 
 def _serialize_msg(msg):
@@ -36,15 +37,24 @@ def _serialize_msg(msg):
     return m
 
 
-def autosave_session(messages, model, sessions_dir, name=AUTOSAVE_NAME):
-    """Scrive atomicamente l'autosave. Salta se solo system prompt.
+_autosave_last_written: dict = {}  # key=path → (timestamp, message_count)
 
-    Ritorna il path scritto (o None se saltato/errore).
+
+def autosave_session(messages, model, sessions_dir, name=AUTOSAVE_NAME):
+    """Atomically write the autosave. Skips if only system prompt or
+    if the last save was recent AND message count hasn't changed.
+
+    Returns the path written (or None if skipped/error).
     """
     if not messages or len(messages) <= 1:
         return None
-    os.makedirs(sessions_dir, exist_ok=True)
     path = os.path.join(sessions_dir, f"{name}.json")
+    now = time.time()
+    last_ts, last_count = _autosave_last_written.get(path, (0, -1))
+    msg_count = len(messages)
+    if msg_count == last_count and (now - last_ts) < AUTOSAVE_MIN_INTERVAL_S:
+        return None  # nothing changed recently, skip disk write
+    os.makedirs(sessions_dir, exist_ok=True)
     payload = {
         'saved_at': time.strftime("%Y-%m-%d %H:%M:%S"),
         'model':    model,
@@ -57,10 +67,11 @@ def autosave_session(messages, model, sessions_dir, name=AUTOSAVE_NAME):
         with os.fdopen(tmp_fd, 'w') as f:
             json.dump(payload, f, ensure_ascii=False)
         os.replace(tmp_path, path)
+        _autosave_last_written[path] = (time.time(), msg_count)
         return path
     except Exception:
         try:
-            os.unlink(tmp_path)  # noqa: F821 (definito solo se mkstemp e' passato)
+            os.unlink(tmp_path)  # noqa: F821 (defined only if mkstemp succeeded)
         except Exception:
             pass
         return None

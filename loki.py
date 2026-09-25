@@ -8,7 +8,10 @@ import json
 import time
 import asyncio
 import threading
+import configparser
+import shutil
 from datetime import datetime
+import loki_plugins
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
@@ -30,30 +33,97 @@ from prompt_toolkit.filters import Condition
 from prompt_toolkit.data_structures import Point
 
 MODEL = os.environ.get('LOKI_MODEL') or "orcarouter/Qwen3.8-27B-Uncensored:latest"
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 PREVIEW_LINES = 20
 SESSIONS_DIR  = os.path.expanduser("~/.loki_sessions")
 MEMORY_FILE   = os.path.expanduser("~/.loki_memory.md")
 WORKSPACE_DIR  = os.path.expanduser("~/.loki_workspace")
 WORKSPACE_FILES = {"plan.md", "failures.md", "ideas.md", "notes.md", "scratch.md"}
-COMPRESS_AT      = 0.80   # comprimi all'80% del context
-COMPRESS_PREEMPT = 0.65   # soglia pre-emptiva: comprimi/cresci PRIMA di inviare la richiesta
-MAX_CTX       = 32768  # tetto reale del modello (rilevato al boot da ollama.show)
-WORKING_CTX   = 8192   # ctx effettivamente passato a Ollama (adattivo, live in stats)
-KEEP_ALIVE    = '15m'  # tiene il modello caricato in RAM tra i turni
-COMPRESS_CTX  = 8192   # num_ctx piu piccolo dedicato alla chiamata di compressione
-OUTPUT_MAX_LINES  = 100   # righe oltre le quali tronchiamo l'output mandato al modello
-OUTPUT_HEAD_LINES = 40    # prime righe da mantenere
-OUTPUT_TAIL_LINES = 30    # ultime righe da mantenere
-OUTPUT_MAX_CHARS  = 6000  # hard cap in caratteri (cattura righe-monstre: JSON, base64, log su una riga)
-KEEP_RECENT_MSG   = 6    # messaggi recenti da preservare dopo compress (arrotondato a inizio turno)
-MEMORY_MAX_SUMMARIES = 5  # quanti riassunti di sessione tenere nel file di memoria
+COMPRESS_AT      = 0.80
+COMPRESS_PREEMPT = 0.65
+MAX_CTX       = 32768
+WORKING_CTX   = 8192
+KEEP_ALIVE    = '15m'
+COMPRESS_CTX  = 8192
+OUTPUT_MAX_LINES  = 100
+OUTPUT_HEAD_LINES = 40
+OUTPUT_TAIL_LINES = 30
+OUTPUT_MAX_CHARS  = 6000
+KEEP_RECENT_MSG   = 6
+MEMORY_MAX_SUMMARIES = 5
+SHELL_TIMEOUT     = 30
+# Memory efficiency: trim old messages every turn (no LLM needed)
+TOOL_OUTPUT_KEEP_CHARS = 400   # chars kept in old tool outputs (head + tail)
+MAX_MESSAGES_BEFORE_COMPRESS = 60  # force compress when history grows this long
+MEMORY_INJECT_MAX_CHARS = 6000  # max chars of memory file injected into system prompt
+CONFIG_FILE = os.path.expanduser("~/.loki.conf")
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
-# Moduli helper (logica pura, niente UI):
-#   loki_hw      -> probe hardware + policy num_ctx adattiva
-#   loki_persist -> autosave per turno + resume-last + prune vecchi
-#   loki_mem     -> memoria capata con rotazione
+# ── Personas ─────────────────────────────────────────────────────────────────
+PERSONAS = {
+    'general': (
+        "You are Loki, a highly capable Linux shell agent. "
+        "Help with coding, system administration, file management, data analysis, and general tasks. "
+        "When executing shell commands, use the run_shell tool. "
+        "Use read_file to examine files and write_file to create or modify them. "
+        "Be direct, concise, and efficient. Never repeat the executed command in your response. "
+        "Never use emoji."
+    ),
+    'security': (
+        "You are an expert red team operator and offensive security specialist with deep Linux sysadmin skills and vision capabilities. "
+        "Your mindset is adversarial by default: always think like an attacker. "
+        "When analyzing targets, proactively identify attack surfaces, misconfigurations, exposed secrets, weak auth, and exploitable vulnerabilities. "
+        "When executing shell commands, use the run_shell tool. Interpret output and extract security-relevant findings. "
+        "Use read_file to inspect configs, binaries, and source code. Use write_file to drop payloads or patch files. "
+        "Suggest concrete next steps: reconnaissance, exploitation, pivoting, persistence, exfiltration. "
+        "Be direct and technical. Skip disclaimers. Never repeat the executed command in the final response. "
+        "Never use emoji."
+    ),
+    'developer': (
+        "You are an expert software developer, code reviewer, and debugger. "
+        "Help with writing, debugging, refactoring, and understanding code across any programming language. "
+        "Use run_shell to run tests, linters, build tools, and git commands. "
+        "Use read_file to examine source code, configs, and logs. Use write_file to apply changes and create new files. "
+        "Be precise, suggest idiomatic solutions, and explain trade-offs when relevant. "
+        "Never use emoji. Never repeat commands you just ran."
+    ),
+    'sysadmin': (
+        "You are an expert Linux sysadmin and DevOps engineer. "
+        "Help manage servers, configure services, troubleshoot issues, and automate repetitive tasks. "
+        "Use run_shell for system commands, log inspection, and service management. "
+        "Use read_file to inspect config files and logs. Use write_file to update config files and scripts. "
+        "Be direct and prioritize system stability, security, and reproducibility. Never use emoji."
+    ),
+}
+ACTIVE_PERSONA = 'general'
+
+
+def load_config():
+    """Load ~/.loki.conf and return a dict of settings. Silent on errors."""
+    cfg = {}
+    if not os.path.isfile(CONFIG_FILE):
+        return cfg
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(CONFIG_FILE)
+        sect = parser['loki'] if 'loki' in parser else {}
+        for key in ('model', 'persona'):
+            if key in sect:
+                cfg[key] = sect[key].strip()
+        for key in ('auto_approve', 'auto_continue', 'show_thinking'):
+            if key in sect:
+                try:
+                    cfg[key] = sect.getboolean(key)
+                except Exception:
+                    pass
+        if 'shell_timeout' in sect:
+            try:
+                cfg['shell_timeout'] = int(sect['shell_timeout'])
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return cfg
 import loki_hw
 import loki_persist
 import loki_mem
@@ -74,31 +144,38 @@ YELLOW = "\033[38;5;220m"
 PURPLE = "\033[38;5;141m"   # lavanda     (thinking block)
 
 SLASH_COMMANDS = {
-    '/help':    'mostra i comandi disponibili',
-    '/clear':   'pulisce la conversazione',
-    '/reset':   'alias di /clear',
-    '/model':   'mostra il modello in uso',
-    '/cwd':     'mostra directory corrente',
-    '/img':     'allega immagine al prossimo messaggio',
-    '/auto':    'attiva approvazione automatica comandi',
-    '/manual':  'disattiva approvazione automatica comandi',
-    '/ac':        'attiva/disattiva auto-continue quando finiscono i token',
-    '/remember':  'salva qualcosa nella memoria persistente',
-    '/memory':    'mostra la memoria persistente',
-    '/compress':  'riassume la conversazione e salva in memoria',
-    '/think':   'mostra/nasconde il ragionamento del modello',
-    '/last':    'ristampa ultimo output completo',
-    '/history': 'statistiche della sessione',
-    '/cost':    'alias di /history',
-    '/save':     'salva la sessione corrente  [nome]',
-    '/resume':   'elenca/riprendi una sessione salvata (senza arg: elenca; /resume <n|nome>: carica e ristampa la storia)',
-    '/resume-last': "riprendi l'autosave dell'ultima sessione (se < 12h)",
-    '/delete':   'elimina una sessione salvata [nome|numero]',
-    '/clone':    'clona una sessione salvata   [sorgente] [nuovo_nome]',
-    '/hw':       'mostra HW rilevato (RAM, thread, GPU, working ctx)',
-    '/exit':     'esci dallo shell agent',
-    '/quit':     'alias di /exit',
+    '/help':    'show available commands',
+    '/clear':   'clear the conversation',
+    '/reset':   'alias of /clear',
+    '/model':   'show model; /model <name> switches to a different model live',
+    '/persona': 'show or switch persona  [general|security|developer|sysadmin]',
+    '/tools':   'list available tools the model can call',
+    '/cwd':     'show current directory',
+    '/img':     'attach an image to the next message',
+    '/auto':    'enable auto-approve for commands',
+    '/manual':  'disable auto-approve for commands',
+    '/ac':        'toggle auto-continue when tokens run out',
+    '/remember':  'save something to persistent memory',
+    '/memory':    'show persistent memory',
+    '/compress':  'summarize the conversation and save to memory',
+    '/think':   'show/hide the model reasoning',
+    '/last':    'reprint the last full output',
+    '/history': 'session statistics',
+    '/cost':    'alias of /history',
+    '/save':     'save the current session  [name]',
+    '/resume':   'list/resume a saved session (no arg: list; /resume <n|name>: load and reprint history)',
+    '/resume-last': "resume the last session's autosave (if < 12h old)",
+    '/search':   'search saved sessions by keyword',
+    '/delete':   'delete a saved session [name|number]',
+    '/clone':    'clone a saved session   [source] [new_name]',
+    '/fetch':    'fetch a URL and show its content  [url]',
+    '/hw':       'show detected HW (RAM, threads, GPU, working ctx)',
+    '/trim':     'free memory now: strip thinking + truncate old tool outputs (no LLM)',
+    '/exit':     'exit the shell agent',
+    '/quit':     'alias of /exit',
 }
+
+_web_confirm_fn = None   # set by loki_web.run() when LOKI_UI=web
 
 stats = {
     'start_time':    datetime.now(),
@@ -122,17 +199,15 @@ tools_schema = [
         "function": {
             "name": "run_shell",
             "description": (
-                "Esegue un comando bash su Linux e restituisce stdout+stderr. "
-                "REGOLA CRITICA: se sai gia' il comando, chiamalo ORA senza altro reasoning. "
-                "Hai coordinate per xdotool? `xdotool click X Y` ORA. "
-                "Devi verificare DISPLAY, un path, un PID? grep/cat/ls ORA. "
-                "Hai considerato 2+ alternative? Scegli la piu' probabile, eseguila ORA. "
-                "L'output reale di un comando fallito vale piu' di qualsiasi ragionamento."
+                "Run a bash command on Linux and return stdout+stderr. "
+                "Use for commands, package management, git, running scripts, etc. "
+                "CRITICAL: if you already know the command, call it NOW without extra reasoning. "
+                "Real output from a failed command is worth more than any reasoning."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string", "description": "Comando bash da eseguire"}
+                    "command": {"type": "string", "description": "Bash command to run"}
                 },
                 "required": ["command"]
             }
@@ -141,16 +216,48 @@ tools_schema = [
     {
         "type": "function",
         "function": {
+            "name": "read_file",
+            "description": "Read the contents of a file from disk. Use for source code, configs, logs, or any text file. Supports partial reads via start_line/end_line.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute or ~-relative path to the file"},
+                    "start_line": {"type": "integer", "description": "First line to read (1-indexed, optional)"},
+                    "end_line": {"type": "integer", "description": "Last line to read inclusive (optional)"}
+                },
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write or overwrite a file on disk. Use to create new files or replace existing ones. Set append=true to add to an existing file without truncating it.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute or ~-relative path to the file"},
+                    "content": {"type": "string", "description": "Full content to write to the file"},
+                    "append": {"type": "boolean", "description": "If true, append to the file instead of overwriting (default false)"}
+                },
+                "required": ["path", "content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "web_search",
             "description": (
-                "Cerca informazioni online (sintassi di tool, documentazione, CVE, workaround). "
-                "Usalo PRIMA di provare a indovinare opzioni o flag sconosciuti, e quando un comando "
-                "fallisce per motivi non chiari. Restituisce snippet di testo rilevanti."
+                "Search for information online (tool syntax, documentation, CVEs, workarounds, recent events). "
+                "Use BEFORE guessing unknown options or flags, and when a command fails for unclear reasons. "
+                "Returns instant answers + search snippets. Follow up with fetch_url to read a result in full."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Stringa di ricerca in inglese o italiano"}
+                    "query": {"type": "string", "description": "Search query in English or Italian"}
                 },
                 "required": ["query"]
             }
@@ -159,26 +266,43 @@ tools_schema = [
     {
         "type": "function",
         "function": {
+            "name": "fetch_url",
+            "description": (
+                "Fetch the full text content of a specific URL (documentation, CVE page, GitHub repo, "
+                "article, man page online, etc.). Use AFTER web_search to read a promising result in detail, "
+                "or when you already have a URL you need to inspect. Returns clean markdown text."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "Full URL to fetch (https://...)"}
+                },
+                "required": ["url"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "workspace_write",
             "description": (
-                "Scrivi o aggiorna un file nella workspace persistente. "
-                "Usa INVECE di ragionare in loop: se stai considerando piu' di 2 opzioni "
-                "o hai fatto un passo fallito, scrivilo su file ORA. "
-                "I file sopravvivono tra i turni — il tuo thinking no. "
-                "plan.md=piano corrente, failures.md=cosa non ha funzionato, "
-                "ideas.md=opzioni considerate, notes.md=note libere, scratch.md=bozze."
+                "Write or update a file in the persistent workspace. "
+                "Use INSTEAD of reasoning in loops: if considering 2+ options or a step failed, write it to file NOW. "
+                "Files survive between turns — your thinking does not. "
+                "plan.md=current plan, failures.md=what failed, "
+                "ideas.md=options considered, notes.md=free notes, scratch.md=drafts."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "file": {
                         "type": "string",
-                        "description": "Nome file: plan.md | failures.md | ideas.md | notes.md | scratch.md"
+                        "description": "File name: plan.md | failures.md | ideas.md | notes.md | scratch.md"
                     },
-                    "content": {"type": "string", "description": "Contenuto da scrivere"},
+                    "content": {"type": "string", "description": "Content to write"},
                     "mode": {
                         "type": "string",
-                        "description": "write=sovrascrivi, append=aggiungi in fondo",
+                        "description": "write=overwrite, append=add to end",
                         "enum": ["write", "append"]
                     }
                 },
@@ -191,23 +315,46 @@ tools_schema = [
         "function": {
             "name": "workspace_read",
             "description": (
-                "Leggi un file dalla workspace. "
-                "Chiamalo all'inizio di sessioni complesse per ricordare dove eri. "
-                "Leggi failures.md prima di riprovare qualcosa che potrebbe gia' aver fallito."
+                "Read a file from the workspace. "
+                "Call at the start of complex sessions to remember where you were. "
+                "Read failures.md before retrying something that may have already failed."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "file": {
                         "type": "string",
-                        "description": "Nome file: plan.md | failures.md | ideas.md | notes.md | scratch.md"
+                        "description": "File name: plan.md | failures.md | ideas.md | notes.md | scratch.md"
                     }
                 },
                 "required": ["file"]
             }
         }
-    }
+    },
 ]
+
+_SEC_TOOLS = {
+    'http_probe', 'encode_decode', 'hash_data', 'identify_hash',
+    'file_entropy', 'check_linux_privesc',
+    'port_scan', 'dns_enum', 'web_fingerprint', 'dir_bruteforce',
+    'jwt_decode', 'generate_payload', 'net_recon', 'cred_harvest',
+    'generate_persist', 'kernel_suggest', 'exfil_payload',
+    'sqli_probe', 'lfi_probe',
+}
+
+def get_active_tools():
+    """Return base tools + security tools (if security persona) + user plugins."""
+    schema = list(tools_schema)
+    if ACTIVE_PERSONA == 'security':
+        try:
+            import loki_sec
+            schema.extend(loki_sec.SECURITY_TOOLS_SCHEMA)
+        except ImportError:
+            pass
+    # User-defined plugins always active, regardless of persona
+    if loki_plugins.tool_names():
+        schema.extend(loki_plugins._plugin_tools)
+    return schema
 
 class SlashOnlyCompleter(Completer):
     def get_completions(self, document, complete_event):
@@ -623,22 +770,35 @@ def show_stats():
     elapsed = datetime.now() - stats['start_time']
     mins = int(elapsed.total_seconds() // 60)
     secs = int(elapsed.total_seconds() % 60)
+    age_h = elapsed.total_seconds() / 3600
     auto_state  = c('ON', GREEN) if stats['auto_approve']  else c('OFF', GRAY)
     think_state = c('ON', GREEN) if stats['show_thinking'] else c('OFF', GRAY)
     ac_state    = c('ON', GREEN) if stats['auto_continue'] else c('OFF', GRAY)
     print()
-    print(f"  {c('SESSIONE', BOLD)}")
-    print(f"    {c('durata', DIM):<20} {mins}m {secs}s")
-    print(f"    {c('messaggi', DIM):<20} {stats['messages']}")
-    print(f"    {c('comandi ok', DIM):<20} {c(str(stats['tools_ok']), GREEN)}")
-    print(f"    {c('comandi no', DIM):<20} {c(str(stats['tools_no']), RED)}")
-    print(f"    {c('auto approve', DIM):<20} {auto_state}")
-    print(f"    {c('mostra thinking', DIM):<20} {think_state}")
-    print(f"    {c('auto continue', DIM):<20} {ac_state}")
-    print(f"    {c('working ctx', DIM):<20} {stats['working_ctx']} / {MAX_CTX} tk")
+    print(f"  {c('SESSION', BOLD)}")
+    print(f"    {c('uptime', DIM):<22} {mins}m {secs}s", end='')
+    if age_h >= 1:
+        print(f"  {c('⚠ use /compress or /trim if lagging', YELLOW)}", end='')
+    print()
+    print(f"    {c('messages', DIM):<22} {stats['messages']}")
+    print(f"    {c('tools ok', DIM):<22} {c(str(stats['tools_ok']), GREEN)}")
+    print(f"    {c('tools failed', DIM):<22} {c(str(stats['tools_no']), RED)}")
+    print(f"    {c('auto approve', DIM):<22} {auto_state}")
+    print(f"    {c('show thinking', DIM):<22} {think_state}")
+    print(f"    {c('auto continue', DIM):<22} {ac_state}")
+    print(f"    {c('working ctx', DIM):<22} {stats['working_ctx']} / {MAX_CTX} tk")
     if stats['ctx_used']:
         pct = int(100 * stats['ctx_used'] / stats['working_ctx'])
-        print(f"    {c('ctx usato ultimo', DIM):<20} {stats['ctx_used']} tk ({pct}%)")
+        bar_filled = int(20 * pct / 100)
+        bar = '█' * bar_filled + '░' * (20 - bar_filled)
+        bar_color = RED if pct >= 70 else YELLOW if pct >= 45 else GREEN
+        print(f"    {c('ctx last turn', DIM):<22} {c(bar, bar_color)} {pct}%  ({stats['ctx_used']} tk)")
+    # Show memory file size
+    if os.path.isfile(MEMORY_FILE):
+        mem_kb = os.path.getsize(MEMORY_FILE) / 1024
+        mem_color = YELLOW if mem_kb > 30 else GREEN
+        print(f"    {c('memory file', DIM):<22} {c(f'{mem_kb:.1f} KB', mem_color)}"
+              f"  {c(f'(inject cap: {MEMORY_INJECT_MAX_CHARS//1000}k chars)', DIM)}")
     print()
 
 def _confirm_sync(command):
@@ -674,6 +834,9 @@ def confirm_command(command):
         print()
         print(f"  {c('⏺', GREEN)} {c('Bash', BOLD)}  {c(command, CYAN)}  {c('[auto]', DIM)}")
         return True
+
+    if _web_confirm_fn is not None:
+        return _web_confirm_fn(command)
 
     app = get_app_or_none()
     if app is None or _MAIN_LOOP is None:
@@ -775,40 +938,108 @@ def _maybe_sudo_apt(command):
     return command
 
 def run_web_search(query):
-    """Cerca online via Jina AI reader + DuckDuckGo Lite. Nessuna API key richiesta."""
+    """Multi-source web search: DDG instant answer API + DDG Lite via Jina reader."""
     import urllib.parse
+    import json as _json
     query = query.strip()
     if not query:
         return "Errore: query vuota"
     q = urllib.parse.quote_plus(query)
-    jina_url = f"https://r.jina.ai/https://lite.duckduckgo.com/lite/?q={q}"
-    cmd = f"curl -s --max-time 15 '{jina_url}'"
     print(f"  {c('web_search:', BLUE)} {query}")
+    results = []
+
+    # 1) DDG Instant Answer API — fast, structured, best for factual/tech queries
     try:
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=18)
+        ddg_api = f"https://api.duckduckgo.com/?q={q}&format=json&no_html=1&skip_disambig=1&t=loki"
+        r = subprocess.run(
+            f"curl -sL --max-time 8 '{ddg_api}'",
+            shell=True, capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            data = _json.loads(r.stdout)
+            section = []
+            if data.get('Answer'):
+                section.append(f"[INSTANT ANSWER] {data['Answer']}")
+            if data.get('AbstractText'):
+                section.append(f"[SUMMARY] {data['AbstractText']}")
+                if data.get('AbstractURL'):
+                    section.append(f"Source: {data['AbstractURL']}")
+            for topic in data.get('RelatedTopics', [])[:5]:
+                if isinstance(topic, dict) and topic.get('Text'):
+                    url = topic.get('FirstURL', '')
+                    line = f"• {topic['Text']}"
+                    if url:
+                        line += f"\n  → {url}"
+                    section.append(line)
+            if section:
+                results.append('\n'.join(section))
+    except Exception:
+        pass
+
+    # 2) DDG Lite via Jina reader — gets actual search snippets + titles
+    try:
+        jina_url = f"https://r.jina.ai/https://lite.duckduckgo.com/lite/?q={q}"
+        r = subprocess.run(
+            f"curl -sL --max-time 15 '{jina_url}'",
+            shell=True, capture_output=True, text=True, timeout=18,
+        )
+        text = r.stdout.strip()
+        if text:
+            _SKIP = ('duckduckgo.com/l/?uddg=', 'URL Source:', 'Title:',
+                     'Markdown Content:', 'Web Search', 'Safe Search',
+                     'Next Page', '---', '===')
+            lines = []
+            for line in text.splitlines():
+                line = line.strip()
+                if not line or len(line) < 16:
+                    continue
+                if any(s in line for s in _SKIP):
+                    continue
+                lines.append(line)
+            if lines:
+                results.append('[SEARCH RESULTS]\n' + '\n'.join(lines[:60]))
+    except Exception:
+        pass
+
+    if not results:
+        return f"Nessun risultato per: {query}"
+
+    combined = '\n\n'.join(results)
+    if len(combined) > 3500:
+        combined = (combined[:3500]
+                    + '\n[...troncato — usa fetch_url <url> per leggere una pagina completa]')
+    return combined
+
+
+def run_fetch_url(url):
+    """Fetch full text content of a URL via Jina AI reader. Returns clean markdown."""
+    url = url.strip().strip('"\'')
+    if not url.startswith('http'):
+        url = 'https://' + url
+    print(f"  {c('fetch_url:', BLUE)} {url}")
+    try:
+        jina_url = f"https://r.jina.ai/{url}"
+        r = subprocess.run(
+            f"curl -sL --max-time 20 '{jina_url}'",
+            shell=True, capture_output=True, text=True, timeout=25,
+        )
         text = r.stdout.strip()
         if not text:
-            return f"Nessun risultato per: {query}"
-        # Filtra righe utili: salta redirect DDG e header Jina
-        lines = []
-        for line in text.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            if any(skip in line for skip in ('duckduckgo.com/l/?uddg=', 'URL Source:', 'Title:', 'Markdown Content:')):
-                continue
-            if line in ('---', '===', '\\---'):
-                continue
-            if len(line) > 15:
-                lines.append(line)
-        result = '\n'.join(lines)
-        if len(result) > 2000:
-            result = result[:2000] + '\n[...troncato]'
-        return result if result.strip() else f"Nessun risultato utile per: {query}"
+            return f"Nessun contenuto da: {url}"
+        # Strip Jina metadata header lines
+        _META = ('URL Source:', 'Title:', 'Markdown Content:', 'Published Time:',
+                 'Description:', 'X-Frame-Options:', 'Content-Type:')
+        lines = [ln for ln in text.splitlines()
+                 if not any(ln.strip().startswith(m) for m in _META)]
+        result = '\n'.join(lines).strip()
+        if len(result) > 6000:
+            result = (result[:6000]
+                      + '\n[...troncato — specifica una sezione o usa read_file per file locali]')
+        return result if result else f"Contenuto vuoto da: {url}"
     except subprocess.TimeoutExpired:
-        return "TIMEOUT: web_search ha superato 18 secondi"
+        return f"TIMEOUT: fetch_url ha superato 20 secondi per {url}"
     except Exception as e:
-        return f"Errore web_search: {e}"
+        return f"Errore fetch_url: {e}"
 
 def run_workspace_write(file, content, mode):
     if file not in WORKSPACE_FILES:
@@ -849,7 +1080,7 @@ def run_shell(command):
     try:
         result = subprocess.run(
             command, shell=True, capture_output=True,
-            text=True, timeout=30
+            text=True, timeout=SHELL_TIMEOUT
         )
         output = (result.stdout + result.stderr).strip() or "(nessun output)"
         stats['last_command'] = command
@@ -858,8 +1089,8 @@ def run_shell(command):
         print_output_block(command, output)          # display intero (truncato dall'UI a PREVIEW_LINES)
         return model_output
     except subprocess.TimeoutExpired:
-        print(c("     TIMEOUT (>30s)", RED))
-        return "TIMEOUT: comando ha superato 30 secondi"
+        print(c(f"     TIMEOUT (>{SHELL_TIMEOUT}s)", RED))
+        return f"TIMEOUT: command exceeded {SHELL_TIMEOUT} seconds"
     finally:
         # Comando finito: torna a "cooking..." per l'eventuale continuazione
         # del modello (che riflette sull'output).
@@ -872,6 +1103,69 @@ def show_last():
     print()
     print_output_block(stats['last_command'] or '', stats['last_output'], expand=True)
     print()
+
+READ_FILE_MAX_BYTES = 200 * 1024  # 200 KB cap per read_file call
+
+
+def run_read_file(path, start_line=None, end_line=None):
+    path = os.path.expanduser(path)
+    if not os.path.isfile(path):
+        return f"ERROR: file not found: {path}"
+    try:
+        size = os.path.getsize(path)
+        with open(path, 'r', errors='replace') as f:
+            lines = f.readlines()
+        total = len(lines)
+        if start_line is not None or end_line is not None:
+            s = max(0, (int(start_line) if start_line else 1) - 1)
+            e = min(total, int(end_line) if end_line else total)
+            selected = lines[s:e]
+        else:
+            selected = lines
+        content = ''.join(selected)
+        truncated = False
+        if len(content) > READ_FILE_MAX_BYTES:
+            content = content[:READ_FILE_MAX_BYTES]
+            truncated = True
+        header = f"# {path}  ({total} lines"
+        if start_line or end_line:
+            s_disp = start_line or 1
+            e_disp = end_line or total
+            header += f", showing {s_disp}–{e_disp}"
+        header += ")\n"
+        result = header + content
+        if truncated:
+            result += f"\n\n[... output truncated at {READ_FILE_MAX_BYTES // 1024}KB — use start_line/end_line for a narrower range ...]"
+        return result
+    except PermissionError:
+        return f"ERROR: permission denied: {path}"
+    except Exception as e:
+        return f"ERROR reading {path}: {e}"
+
+
+def run_write_file(path, content, append=False):
+    path = os.path.expanduser(path)
+    mode_str = 'append to' if append else 'overwrite'
+    n_lines = len(content.splitlines())
+    cmd_display = f"write_file({mode_str}): {path}  [{n_lines} lines]"
+    if not confirm_command(cmd_display):
+        stats['tools_no'] += 1
+        return "WRITE REJECTED BY THE USER"
+    stats['tools_ok'] += 1
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        mode = 'a' if append else 'w'
+        with open(path, mode) as f:
+            f.write(content)
+        verb = 'appended' if append else 'wrote'
+        return f"OK: {verb} {n_lines} lines to {path}"
+    except Exception as e:
+        stats['tools_ok'] -= 1
+        stats['tools_no'] += 1
+        return f"ERROR writing {path}: {e}"
+
 
 def load_memory():
     if os.path.isfile(MEMORY_FILE):
@@ -895,68 +1189,54 @@ def show_memory():
     print()
 
 def build_system_prompt():
-    base = (
-        "You are an expert red team operator and offensive security specialist with deep Linux sysadmin skills and vision capabilities. "
-        "Your mindset is adversarial by default: always think like an attacker. "
-        "When analyzing targets, proactively identify attack surfaces, misconfigurations, exposed secrets, weak auth, and exploitable vulnerabilities. "
-        "When executing shell commands, use the run_shell tool. Interpret output and extract security-relevant findings. "
-        "Suggest concrete next steps: reconnaissance, exploitation, pivoting, persistence, exfiltration. "
-        "Be direct and technical. Skip disclaimers. Never repeat the executed command in the final response. "
-        "Never use emoji."
-    )
+    base = PERSONAS.get(ACTIVE_PERSONA, PERSONAS['general'])
     ops = (
-        "\n\n## REGOLE OPERATIVE — efficienza del contesto"
-        "\nIl tuo context window e' limitato: ogni output di comando lo consuma. Lavora parsimonioso."
-        "\n- Prima di eseguire stima se l'output sara' grande. Se puo' esserlo, filtralo ALLA FONTE:"
-        " `head -50 file`, `grep PATTERN file`, `cmd | head -30`, `wc -l`. Mai `cat` di file grandi."
-        "\n- Anteponi `timeout N` ai comandi che possono bloccarsi (rete, scansioni, prompt interattivi)."
-        " Non lanciare comandi che restano in foreground senza timeout."
-        "\n- Per task in piu' passi: scrivi un piano breve in 3-5 punti, poi eseguilo un passo alla volta."
-        " Aggiorna il piano dopo ogni passo. Niente raffiche di comandi tutti insieme."
-        "\n- Usa il comando MINIMO che produce l'informazione che ti serve adesso."
-        " `cmd --help | head -30` invece del man completo. `ls dir | head` invece del ricorsivo."
-        "\n- Non ripetere un comando fallito identico: cambia approccio, opzioni o strumento."
-        " Se l'output e' stato troncato, restringilo con grep/sed/head invece di rilanciarlo raw."
-        "\n- Se un flag, sintassi o strumento ti e' sconosciuto o ha dato errore inspiegabile,"
-        " usa SUBITO web_search prima di provare a indovinare. E' piu' veloce di 10 tentativi ciechi."
-        "\n- Ragiona conciso. Pianifica, poi agisci. Punta alla risposta col minor numero di comandi."
+        "\n\n## OPERATIVE RULES — context efficiency"
+        "\nYour context window is limited: every command output consumes it. Work parsimoniously."
+        "\n- Before running, estimate if output will be large. If it might, filter AT THE SOURCE:"
+        " `head -50 file`, `grep PATTERN file`, `cmd | head -30`, `wc -l`. Never `cat` large files."
+        "\n- Prepend `timeout N` to commands that can block (network, scans, interactive prompts)."
+        " Never launch foreground commands without a timeout."
+        "\n- For multi-step tasks: write a short 3-5 point plan, then execute one step at a time."
+        " Update the plan after each step. No command barrages."
+        "\n- Use the MINIMUM command that produces the information you need now."
+        " `cmd --help | head -30` instead of the full man. `ls dir | head` instead of recursive."
+        "\n- Never repeat an identical failed command: change approach, options, or tool."
+        " If output was truncated, narrow it with grep/sed/head instead of relaunching raw."
+        "\n- If a flag, syntax or tool is unknown or gave an inexplicable error,"
+        " use web_search IMMEDIATELY before guessing. Faster than 10 blind attempts."
+        "\n- Reason concisely. Plan, then act. Aim for the answer with the fewest commands."
     )
     think = (
-        "\n\n## DISCIPLINA DEL RAGIONAMENTO — vincolo assoluto"
-        "\n**NEMICO PRINCIPALE**: il reasoning loop — ragionare su 2+ alternative senza eseguirne"
-        " nessuna, o considerare la stessa opzione 2+ volte. Questo consuma context window senza"
-        " produrre informazioni reali. L'output di un comando fallito vale piu' di 1000 token di"
-        " ragionamento a priori."
-        "\n\n**CONTRATTO OBBLIGATORIO — ogni turno di thinking DEVE terminare con UNA di queste due:**"
-        "\n  A) una tool call (run_shell o web_search)"
-        "\n  B) una risposta finale in testo all'utente"
-        "\nNon esiste opzione C (thinking senza azione). Se stai per scegliere C, scegli A."
-        "\n\n**TRIPWIRE — queste condizioni scatenano una tool call IMMEDIATA, senza ulteriore reasoning:**"
-        "\n- Conosci gia' il comando da eseguire → eseguilo ORA. Non pensarci ancora."
-        "\n- Hai coordinate x,y per xdotool → lancia `xdotool click X Y` ORA."
-        "\n- Hai un path, un PID, una env var da verificare → usa run_shell ORA."
-        "\n- Hai considerato la stessa opzione 2+ volte → prendi la piu' probabile, eseguila ORA."
-        "\n- Hai fatto 3+ passi di reasoning senza tool call → lancia `echo 'CP: [stato]'` ORA."
-        "\n- Un comando ha fallito con errore non ovvio → diagnostica ORA: `cat /proc/PID/environ`,"
-        " `echo $DISPLAY`, `which CMD`, `ls -la PATH`. Non ragionare sul perche'."
-        "\n- Non conosci la sintassi esatta di un flag → usa web_search ORA, non indovinare."
-        "\n\n**REGOLA DEL PIANO SCRITTO**: all'inizio di ogni task esegui SUBITO"
-        " `echo 'PIANO: 1)... 2)... 3)...'`. Il thinking serve a PIANIFICARE il prossimo"
-        " singolo passo, non a deliberare tra opzioni gia' identificate."
-        "\n\n**IL TUO THINKING NON E' SALVATO NEL CONTESTO.** Se viene troncato e' perso."
-        " Ogni pensiero che non culmina in una tool call e' context window bruciata."
+        "\n\n## REASONING DISCIPLINE — absolute constraint"
+        "\n**MAIN ENEMY**: reasoning loop — reasoning about 2+ alternatives without executing any,"
+        " or considering the same option 2+ times. This burns context window without producing real info."
+        " Output from a failed command is worth more than 1000 tokens of prior reasoning."
+        "\n\n**MANDATORY CONTRACT — every thinking turn MUST end with ONE of:**"
+        "\n  A) a tool call (run_shell, web_search, fetch_url, read_file, write_file, workspace_write/read, or a security tool)"
+        "\n  B) a final text response to the user"
+        "\nOption C does not exist (thinking without action). If about to choose C, choose A."
+        "\n\n**TRIPWIRE — these conditions trigger an IMMEDIATE tool call, no further reasoning:**"
+        "\n- You already know the command to run → run it NOW. Don't think about it more."
+        "\n- You have a path, PID, env var to verify → use run_shell NOW."
+        "\n- You've considered the same option 2+ times → take the most likely, execute NOW."
+        "\n- You've done 3+ reasoning steps without a tool call → run `echo 'CP: [state]'` NOW."
+        "\n- A command failed with a non-obvious error → diagnose NOW."
+        "\n- You don't know the exact syntax of a flag → use web_search NOW, don't guess."
+        "\n\n**YOUR THINKING IS NOT SAVED IN CONTEXT.** If truncated it's lost."
+        " Every thought that doesn't culminate in a tool call is burned context window."
     )
     workspace = (
-        "\n\n## WORKSPACE — memoria persistente tra i turni"
-        "\n- workspace_write/read: file .md in ~/.loki_workspace/ che sopravvivono tra i turni."
-        "\n- Il tuo thinking viene scartato dopo ogni turno. I file no."
-        "\n- REGOLA: se ti ritrovi a pensare la stessa cosa per la seconda volta → scrivi su workspace invece."
-        "\n- plan.md: piano passi corrente (aggiorna dopo ogni passo completato)"
-        "\n- failures.md: cosa hai provato che NON ha funzionato (leggi PRIMA di riprovare)"
-        "\n- ideas.md: opzioni considerate, pro/contro"
-        "\n- notes.md: osservazioni, output importanti da ricordare"
-        "\n- scratch.md: bozze libere"
-        "\n- TRIPWIRE: stai considerando 3+ opzioni? → workspace_write su ideas.md ORA, poi decidi."
+        "\n\n## WORKSPACE — persistent memory between turns"
+        "\n- workspace_write/read: .md files in ~/.loki_workspace/ that survive between turns."
+        "\n- Your thinking is discarded after each turn. Files are not."
+        "\n- RULE: if you find yourself thinking the same thing a second time → write to workspace instead."
+        "\n- plan.md: current step plan (update after each completed step)"
+        "\n- failures.md: what you tried that did NOT work (read BEFORE retrying)"
+        "\n- ideas.md: options considered, pros/cons"
+        "\n- notes.md: observations, important output to remember"
+        "\n- scratch.md: free drafts"
+        "\n- TRIPWIRE: considering 3+ options? → workspace_write to ideas.md NOW, then decide."
     )
     plan_path = os.path.join(WORKSPACE_DIR, "plan.md")
     plan_section = ""
@@ -965,11 +1245,15 @@ def build_system_prompt():
             with open(plan_path, 'r', encoding='utf-8') as _f:
                 _plan = _f.read().strip()
             if _plan:
-                plan_section = f"\n\n## PIANO CORRENTE (da workspace)\n{_plan}"
+                plan_section = f"\n\n## CURRENT PLAN (from workspace)\n{_plan}"
     except Exception:
         pass
     mem = load_memory()
-    mem_section = f"\n\n## MEMORIA PERSISTENTE\n{mem}" if mem else ""
+    if mem and len(mem) > MEMORY_INJECT_MAX_CHARS:
+        # Inject only the tail (most recent summaries) to cap system prompt size.
+        # Full file stays on disk; only token cost is reduced.
+        mem = f"[...older memory truncated: {len(mem) - MEMORY_INJECT_MAX_CHARS} chars...]\n\n" + mem[-MEMORY_INJECT_MAX_CHARS:]
+    mem_section = f"\n\n## PERSISTENT MEMORY\n{mem}" if mem else ""
     return base + ops + think + workspace + mem_section + plan_section
 
 def _find_turn_start(messages, idx):
@@ -1053,6 +1337,40 @@ def estimate_context_tokens(messages):
             args = fn.get('arguments', {}) or {}
             chars += len(str(args))
     return chars // 4
+
+
+def _trim_old_messages(messages):
+    """Free memory every turn without calling the LLM.
+
+    For messages older than KEEP_RECENT_MSG:
+    - Strips thinking blocks (they are never needed after the turn ends)
+    - Truncates tool outputs to TOOL_OUTPUT_KEEP_CHARS (head + tail)
+
+    Returns a new list; the original is not mutated.
+    """
+    if len(messages) <= KEEP_RECENT_MSG + 1:
+        return messages
+    cutoff = max(1, len(messages) - KEEP_RECENT_MSG)
+    result = list(messages)
+    for i in range(1, cutoff):
+        m = result[i]
+        changed = False
+        # Drop thinking — useless after the turn
+        if m.get('thinking'):
+            m = {k: v for k, v in m.items() if k != 'thinking'}
+            changed = True
+        # Truncate large tool outputs
+        if m.get('role') == 'tool':
+            content = m.get('content', '')
+            if len(content) > TOOL_OUTPUT_KEEP_CHARS:
+                head = content[:TOOL_OUTPUT_KEEP_CHARS // 2]
+                tail = content[-(TOOL_OUTPUT_KEEP_CHARS // 4):]
+                omitted = len(content) - TOOL_OUTPUT_KEEP_CHARS // 2 - TOOL_OUTPUT_KEEP_CHARS // 4
+                m = {**m, 'content': f"{head}\n[...{omitted} chars trimmed...]\n{tail}"}
+                changed = True
+        if changed:
+            result[i] = m
+    return result
 
 
 def compress_context(messages):
@@ -1183,34 +1501,59 @@ def _session_path(name):
     safe = re.sub(r'[^\w\-]', '_', name)
     return os.path.join(SESSIONS_DIR, f"{safe}.json")
 
-def _serialize_msg(msg):
-    m = dict(msg)
-    if 'tool_calls' in m and m['tool_calls']:
-        tcs = []
-        for tc in m['tool_calls']:
-            if isinstance(tc, dict):
-                tcs.append(tc)
-            else:
-                fn = tc.function if hasattr(tc, 'function') else {}
-                tcs.append({'function': {
-                    'name':      getattr(fn, 'name', ''),
-                    'arguments': getattr(fn, 'arguments', {}),
-                }})
-        m['tool_calls'] = tcs
-    return m
+def _generate_session_title(messages):
+    """Ask the LLM for a 4-5 word dash-slug title. Falls back to timestamp."""
+    samples = []
+    for m in messages[1:]:
+        if m.get('role') in ('user', 'assistant') and m.get('content'):
+            samples.append(m['content'][:200])
+        if len(samples) >= 6:
+            break
+    if not samples:
+        return datetime.now().strftime("%Y%m%d_%H%M%S")
+    transcript = "\n".join(samples)
+    try:
+        resp = ollama.chat(
+            model=MODEL,
+            messages=[{"role": "user", "content": (
+                "Generate a 4-5 word title for this conversation. "
+                "Reply with ONLY the title: lowercase english words separated by dashes, "
+                "no punctuation, no quotes, no explanation.\n"
+                "Good examples: debug-nginx-timeout, setup-python-venv, analyze-auth-logs\n\n"
+                f"Conversation:\n{transcript}"
+            )}],
+            stream=False,
+            options={'num_ctx': 4096, 'num_predict': 20, 'temperature': 0.2},
+            keep_alive=KEEP_ALIVE,
+        )
+        raw = (resp.get('message', {}).get('content') or '').strip().lower()
+        slug = re.sub(r'[^\w\s-]', '', raw)
+        slug = re.sub(r'[\s_]+', '-', slug.strip())[:50]
+        if slug and re.search(r'[a-z]', slug):
+            return slug
+    except Exception:
+        pass
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
 
-def save_session(messages, name=None):
+
+def save_session(messages, name=None, auto_title=False):
     if not name:
-        name = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if auto_title and len(messages) > 2:
+            write(f"\n  {c('◎ generating title...', PURPLE)}  ")
+            name = _generate_session_title(messages)
+            write(f"\r  {c('◎ title:', PURPLE)} {c(name, ORANGE)}            \n")
+        else:
+            name = datetime.now().strftime("%Y%m%d_%H%M%S")
     payload = {
         'saved_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         'model':    MODEL,
-        'messages': [_serialize_msg(m) for m in messages[1:]],
+        'persona':  ACTIVE_PERSONA,
+        'messages': [loki_persist._serialize_msg(m) for m in messages[1:]],
     }
     path = _session_path(name)
     with open(path, 'w') as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
-    print(f"\n  {c('sessione salvata:', DIM)} {c(name, ORANGE)}  {c(path, DGRAY)}\n")
+    print(f"\n  {c('session saved:', DIM)} {c(name, ORANGE)}  {c(path, DGRAY)}\n")
     return name
 
 def _replay_message(m):
@@ -1318,7 +1661,51 @@ def parse_slash(text, messages=None):
     if cmd in ('/clear', '/reset'):
         return 'clear', None
     if cmd == '/model':
-        print(f"  {c('modello:', DIM)} {MODEL}\n")
+        global MODEL
+        if arg.strip():
+            MODEL = arg.strip()
+            print(f"  {c('model switched to:', DIM)} {c(MODEL, ORANGE)}\n")
+        else:
+            print(f"  {c('model:', DIM)} {MODEL}\n")
+        return 'handled', None
+    if cmd == '/persona':
+        global ACTIVE_PERSONA
+        arg = arg.strip().lower()
+        if not arg:
+            print()
+            print(f"  {c('PERSONAS', BOLD)}")
+            for name, desc in PERSONAS.items():
+                marker = c('►', ORANGE) if name == ACTIVE_PERSONA else ' '
+                first_sentence = desc.split('.')[0] + '.'
+                print(f"    {marker} {c(name, BOLD if name == ACTIVE_PERSONA else GRAY):<18} {c(first_sentence[:60], DIM)}")
+            print(f"\n  {c('current:', DIM)} {ACTIVE_PERSONA}")
+            print(f"  {c('switch:', DIM)} /persona <name>\n")
+        elif arg in PERSONAS:
+            ACTIVE_PERSONA = arg
+            if messages and messages[0]['role'] == 'system':
+                messages[0]['content'] = build_system_prompt()
+            print(f"  {c('persona:', DIM)} {c(ACTIVE_PERSONA, ORANGE)}\n")
+        else:
+            opts = ', '.join(PERSONAS.keys())
+            print(c(f"  unknown persona: {arg}. Available: {opts}\n", RED))
+        return 'handled', None
+    if cmd == '/tools':
+        print()
+        print(f"  {c('AVAILABLE TOOLS', BOLD)}")
+        for tool in get_active_tools():
+            fn = tool['function']
+            name = fn['name']
+            desc = fn['description'].split('.')[0]
+            props = fn['parameters']['properties']
+            required = fn['parameters'].get('required', [])
+            print(f"\n    {c(name, ORANGE)}")
+            print(f"      {c(desc, GRAY)}")
+            for pname, pdef in props.items():
+                req_mark = '*' if pname in required else ' '
+                ptype = pdef.get('type', '?')
+                pdesc = pdef.get('description', '')[:60]
+                print(f"      {c(req_mark + pname, CYAN):<18} {c(ptype, DIM):<10} {c(pdesc, GRAY)}")
+        print()
         return 'handled', None
     if cmd == '/cwd':
         print(f"  {c('cwd:', DIM)} {os.getcwd()}\n")
@@ -1348,6 +1735,17 @@ def parse_slash(text, messages=None):
     if cmd == '/compress':
         if messages:
             return 'compress', messages
+        return 'handled', None
+    if cmd == '/trim':
+        if messages:
+            before = estimate_context_tokens(messages)
+            trimmed = _trim_old_messages(messages)
+            after = estimate_context_tokens(trimmed)
+            saved = max(0, before - after)
+            msg_count = len([m for m in messages if m.get('role') == 'tool'])
+            print(f"  {c('✓ trim done', GREEN)}  {c(f'~{saved} tokens freed', GRAY)}  "
+                  f"{c(f'{msg_count} tool msgs processed', DIM)}\n")
+            return 'trim', trimmed
         return 'handled', None
     if cmd == '/think':
         stats['show_thinking'] = not stats['show_thinking']
@@ -1422,7 +1820,8 @@ def parse_slash(text, messages=None):
         return 'handled', None
     if cmd == '/save':
         if messages:
-            save_session(messages, arg.strip() or None)
+            explicit = arg.strip()
+            save_session(messages, explicit or None, auto_title=not explicit)
         else:
             print(c("  nessun messaggio da salvare\n", DIM))
         return 'handled', None
@@ -1450,6 +1849,46 @@ def parse_slash(text, messages=None):
             import shutil
             shutil.copy2(src_path, dst_path)
             print(f"  {c('clonata:', DIM)} {c(src_arg, GRAY)} {c('→', DGRAY)} {c(dst_name, ORANGE)}\n")
+        return 'handled', None
+    if cmd == '/search':
+        term = arg.strip().lower()
+        if not term:
+            print(c("  usage: /search <keyword>\n", GRAY))
+            return 'handled', None
+        matches = []
+        if os.path.isdir(SESSIONS_DIR):
+            for fname in sorted(os.listdir(SESSIONS_DIR), reverse=True):
+                if not fname.endswith('.json'):
+                    continue
+                fpath = os.path.join(SESSIONS_DIR, fname)
+                try:
+                    with open(fpath) as sf:
+                        data = json.load(sf)
+                    found_in = None
+                    for m in data.get('messages', []):
+                        if term in (m.get('content') or '').lower():
+                            found_in = (m.get('content') or '')[:100].replace('\n', ' ')
+                            break
+                    if found_in is not None:
+                        matches.append((fname[:-5], data.get('saved_at', '?'), found_in))
+                except Exception:
+                    pass
+        if not matches:
+            print(c(f"\n  no sessions found for: {arg}\n", DIM))
+        else:
+            print(f"\n  {c('SEARCH RESULTS', BOLD)} for {c(arg, ORANGE)}  {c(f'{len(matches)} found', GRAY)}")
+            for name, saved, snippet in matches:
+                print(f"\n    {c(name, BOLD)}  {c(saved, DIM)}")
+                print(f"    {c(snippet[:80], DGRAY)}")
+            print(f"\n  {c('load one:', DIM)} {c('/resume <name>', ORANGE)}\n")
+        return 'handled', None
+    if cmd == '/fetch':
+        url = arg.strip()
+        if not url:
+            print(c("  uso: /fetch <url>\n", GRAY))
+        else:
+            result = run_fetch_url(url)
+            print(f"\n{result}\n")
         return 'handled', None
     if cmd == '/img':
         path = os.path.expanduser(arg.strip().strip('"\''))
@@ -1624,7 +2063,7 @@ def stream_response(messages):
         stream = ollama.chat(
             model=MODEL,
             messages=prepare_messages_for_api(messages),
-            tools=tools_schema,
+            tools=get_active_tools(),
             think=True,
             stream=True,
             options={'num_ctx': stats['working_ctx']},
@@ -1763,10 +2202,20 @@ def _run_turn(state):
     """
     messages = state['messages']
 
+    # Dynamic COMPRESS_PREEMPT: lower the threshold as the session ages.
+    # After 1h → 0.55, after 2h → 0.45. Prevents late-session lag buildup.
+    _session_age_h = (datetime.now() - stats['start_time']).total_seconds() / 3600
+    if _session_age_h >= 2:
+        _eff_preempt = 0.45
+    elif _session_age_h >= 1:
+        _eff_preempt = 0.55
+    else:
+        _eff_preempt = COMPRESS_PREEMPT
+
     # Compressione pre-emptiva: intervieni PRIMA di inviare se il contesto stimato
-    # supera COMPRESS_PREEMPT del working_ctx, invece di aspettare done_reason=length.
+    # supera _eff_preempt del working_ctx, invece di aspettare done_reason=length.
     est = estimate_context_tokens(messages)
-    if est >= int(stats['working_ctx'] * COMPRESS_PREEMPT):
+    if est >= int(stats['working_ctx'] * _eff_preempt):
         new_ctx = loki_hw.next_working_ctx(stats['working_ctx'], MAX_CTX)
         if new_ctx > stats['working_ctx']:
             old = stats['working_ctx']
@@ -1797,55 +2246,92 @@ def _run_turn(state):
             no_action_strikes = 0   # tool call eseguita: reset contatore reasoning loop
             for tc in msg['tool_calls']:
                 fn = tc.get('function', {})
-                name = fn.get('name')
-                args = fn.get('arguments', {}) if isinstance(fn.get('arguments'), dict) else {}
-                if name == 'run_shell':
-                    output = run_shell(args.get('command', ''))
-                elif name == 'web_search':
+                tool_name = fn.get('name', '')
+                args = fn.get('arguments', {}) or {}
+                if not isinstance(args, dict):
+                    args = {}
+                if tool_name == 'run_shell':
+                    cmd_arg = args.get('command', '')
+                    output = run_shell(cmd_arg)
+                elif tool_name == 'read_file':
+                    output = run_read_file(
+                        args.get('path', ''),
+                        args.get('start_line'),
+                        args.get('end_line'),
+                    )
+                elif tool_name == 'write_file':
+                    output = run_write_file(
+                        args.get('path', ''),
+                        args.get('content', ''),
+                        bool(args.get('append', False)),
+                    )
+                elif tool_name == 'web_search':
                     output = run_web_search(args.get('query', ''))
-                elif name == 'workspace_write':
+                elif tool_name == 'fetch_url':
+                    output = run_fetch_url(args.get('url', ''))
+                elif tool_name == 'workspace_write':
                     output = run_workspace_write(
                         args.get('file', ''),
                         args.get('content', ''),
-                        args.get('mode', 'append')
+                        args.get('mode', 'append'),
                     )
-                elif name == 'workspace_read':
+                elif tool_name == 'workspace_read':
                     output = run_workspace_read(args.get('file', ''))
+                elif tool_name in _SEC_TOOLS:
+                    try:
+                        import loki_sec
+                        sec_fn = getattr(loki_sec, tool_name)
+                        output = sec_fn(**args)
+                    except Exception as e:
+                        output = f"ERROR calling {tool_name}: {e}"
+                elif tool_name in loki_plugins.tool_names():
+                    output = loki_plugins.dispatch(tool_name, args)
                 else:
-                    output = f"Tool sconosciuto: {name}"
+                    output = f"ERROR: unknown tool: {tool_name}"
                 messages.append({"role": "tool", "content": output})
             continue
         elif (not msg.get('tool_calls')
               and not (msg.get('content') or '').strip()
-              and len((msg.get('thinking') or '').split()) > 150
+              and len((msg.get('thinking') or '').split()) > 80
               and msg.get('done_reason') != 'length'):
-            # Turno terminato NORMALMENTE (done_reason='stop') con SOLO thinking
-            # e zero azioni: il modello e' in reasoning loop silenzioso.
-            # Questo era il buco del detector precedente (scattava solo su 'length').
-            # I turni done_reason='length' con thinking-only vanno al branch successivo
-            # che gestisce anche la crescita del context prima di reinvocare.
+            # Turn ended normally with ONLY thinking and zero actions → reasoning loop.
+            # (done_reason=length + thinking-only goes to the length branch below)
             thinking_words = len((msg.get('thinking') or '').split())
+
+            # Strip thinking from the looping message immediately: it's already
+            # displayed, keeping it in context only wastes tokens.
+            messages[-1] = {k: v for k, v in messages[-1].items() if k != 'thinking'}
+
             no_action_strikes += 1
-            if no_action_strikes >= 3:
-                print(f"\n  {c(f'⚠ reasoning loop [{no_action_strikes}/3] — interruzione forzata', YELLOW)}\n")
-                no_action_strikes = 0
+            if no_action_strikes >= 2:
+                # Hard break: scrub loop artifacts from history so they don't
+                # accumulate. Walk back and remove silent-assistant turns and
+                # the injected user reminders that preceded them.
+                _clean_idx = len(messages) - 1
+                _LOOP_PREFIXES = ('STOP.', 'REASONING LOOP')
+                while _clean_idx > 1:
+                    m = messages[_clean_idx]
+                    is_silent_asst = (m.get('role') == 'assistant'
+                                      and not m.get('tool_calls')
+                                      and not (m.get('content') or '').strip())
+                    is_loop_reminder = (m.get('role') == 'user'
+                                        and any((m.get('content') or '').startswith(p)
+                                                for p in _LOOP_PREFIXES))
+                    if is_silent_asst or is_loop_reminder:
+                        _clean_idx -= 1
+                    else:
+                        break
+                messages[:] = messages[:_clean_idx + 1]
+                print(f"\n  {c(f'⚠ reasoning loop — break after 2 silent turns ({thinking_words} words)', YELLOW)}\n")
                 break
-            _ESCALATION = [
-                (
-                    "ATTENZIONE: hai ragionato {w} parole senza eseguire nulla [{s}/3]. "
-                    "CONTRATTO OBBLIGATORIO: ogni turno deve produrre una tool call o una risposta finale. "
-                    "Esegui SUBITO run_shell o web_search. Quale azione fisica esegui adesso?"
-                ),
-                (
-                    "SECONDO AVVISO — REASONING LOOP [{s}/3]: {w} parole di thinking, zero azioni. "
-                    "BLOCCO AUTOMATICO AL PROSSIMO TURNO INATTIVO. "
-                    "Smetti di ragionare. Lancia ADESSO la tool call piu' probabile. "
-                    "Se hai 2+ opzioni, scegli la prima e basta — l'output ti dira' se era giusta."
-                ),
-            ]
-            template = _ESCALATION[min(no_action_strikes - 1, len(_ESCALATION) - 1)]
-            reminder = template.format(w=thinking_words, s=no_action_strikes)
-            print(f"\n  {c(f'⚠ reasoning loop [{no_action_strikes}/3] — {thinking_words} parole senza azione', YELLOW)}\n")
+
+            # Strike 1: minimal reminder, saves context vs long escalation message
+            reminder = (
+                f"STOP. {thinking_words} words of thinking, zero actions. "
+                "Call a tool NOW — run_shell, web_search or fetch_url. "
+                "Pick the most likely option and execute it. No more reasoning."
+            )
+            print(f"\n  {c(f'⚠ reasoning loop [1/2] — {thinking_words} words, no action', YELLOW)}\n")
             messages.append({"role": "user", "content": reminder})
             continue
         elif msg.get('done_reason') == 'length' and stats['auto_continue']:
@@ -1874,18 +2360,18 @@ def _run_turn(state):
                 state['messages'] = compress_context(messages)
                 messages = state['messages']
             print(f"  {c('↻ limite token raggiunto — continuo...', GRAY)}\n")
-            # Se il thinking e' lungo ma non ci sono tool call, il modello e'
-            # in loop mentale. Inietta un reminder urgente nel contesto.
+            # Thinking-only + done_reason=length: model was looping when ctx ran out.
+            # Strip the thinking blob before re-injecting (it's gone anyway — truncated).
             thinking_len = len((msg.get('thinking') or '').split())
             no_action = not msg.get('tool_calls') and not (msg.get('content') or '').strip()
-            if thinking_len > 150 and no_action:
+            if thinking_len > 80 and no_action:
+                # Strip thinking from the truncated message — it was cut off anyway,
+                # keeping it pollutes context with an incomplete blob.
+                messages[-1] = {k: v for k, v in messages[-1].items() if k != 'thinking'}
                 no_action_strikes += 1
                 reminder = (
-                    f"REASONING LOOP RILEVATO [{no_action_strikes}]: il tuo thinking e' stato"
-                    f" troncato dopo {thinking_len} parole ed e' andato perso per sempre."
-                    " REGOLA ASSOLUTA: smetti di ragionare e lancia SUBITO un tool call."
-                    " Anche solo `echo 'CHECKPOINT: [stato attuale in una riga]'`."
-                    " L'output di un comando fallito vale piu' di qualsiasi ragionamento."
+                    f"REASONING LOOP: thinking truncated after {thinking_len} words — lost forever. "
+                    "Call a tool NOW: run_shell, web_search or fetch_url. No more reasoning."
                 )
                 messages.append({"role": "user", "content": reminder})
             else:
@@ -1911,6 +2397,19 @@ def _run_turn(state):
                     state['messages'] = compress_context(messages)
                     messages = state['messages']
             break
+
+    # Lightweight memory cleanup every turn: strip thinking + truncate old
+    # tool outputs. Free, no LLM call. Keeps RAM lean during long sessions.
+    state['messages'] = _trim_old_messages(state['messages'])
+    messages = state['messages']
+
+    # Message-count hard cap: if history grew too long, force an LLM compress
+    # even if context % hasn't hit the threshold yet. Prevents lag after hours.
+    non_sys = [m for m in messages if m.get('role') != 'system']
+    if len(non_sys) > MAX_MESSAGES_BEFORE_COMPRESS:
+        print(f"\n  {c(f'⚠ {len(non_sys)} messaggi in history — comprimo automaticamente...', YELLOW)}")
+        state['messages'] = compress_context(messages)
+        messages = state['messages']
 
     # Autosave dopo ogni turno completato (o interrotto): l'utente non deve
     # perdere una sessione lunga per un crash del terminale o di Ollama.
@@ -1938,6 +2437,9 @@ def _handle_slash(text, state):
         return False
     if action == 'compress':
         state['messages'] = compress_context(state['messages'])
+        return False
+    if action == 'trim':
+        state['messages'] = payload
         return False
     if action == 'picker':
         _picker_activate(state)
@@ -2560,23 +3062,183 @@ async def async_chat_loop_fullscreen():
     print(c("\n  Arrivederci.\n", DIM))
 
 
+def run_oneshot(query, stdin_data=None, exec_cmd=None):
+    """Non-interactive one-shot mode: process a single query and exit.
+
+    Handles three entry points:
+      loki "question"              → query from argv
+      echo "q" | loki             → query from piped stdin
+      loki --exec "cmd" "question" → run cmd first, inject output as context
+    """
+    # If --exec was given, run the command and prepend its output to the query
+    if exec_cmd:
+        try:
+            import subprocess as _sp
+            result = _sp.run(exec_cmd, shell=True, capture_output=True,
+                             text=True, timeout=SHELL_TIMEOUT)
+            exec_out = (result.stdout + result.stderr).strip()
+            if exec_out:
+                query = f"Command: {exec_cmd}\n\nOutput:\n{exec_out}\n\n{query or 'Analyze this output.'}"
+        except Exception as e:
+            query = f"Command failed: {exec_cmd}\nError: {e}\n\n{query or ''}"
+
+    # Prepend piped stdin to the query
+    if stdin_data:
+        query = f"{stdin_data.strip()}\n\n{query}" if query else stdin_data.strip()
+
+    if not query:
+        sys.stderr.write("loki: no query provided\n")
+        sys.exit(1)
+
+    messages = [
+        {"role": "system",  "content": build_system_prompt()},
+        {"role": "user",    "content": query},
+    ]
+
+    # Stream response directly to stdout (no fullscreen UI)
+    thinking_buf = []
+    show_think = os.environ.get('LOKI_THINK', '0') == '1'
+    try:
+        stream = ollama.chat(
+            model=MODEL,
+            messages=messages,
+            tools=get_active_tools(),
+            think=True,
+            stream=True,
+            options={'num_ctx': stats['working_ctx']},
+            keep_alive=KEEP_ALIVE,
+        )
+        in_thinking = False
+        for chunk in stream:
+            msg = chunk.get('message', {})
+            think_piece = msg.get('thinking') or ''
+            content_piece = msg.get('content') or ''
+            if think_piece:
+                in_thinking = True
+                thinking_buf.append(think_piece)
+            if in_thinking and not think_piece and content_piece:
+                in_thinking = False
+                if show_think and thinking_buf:
+                    sys.stdout.write(f"<think>\n{''.join(thinking_buf)}\n</think>\n\n")
+            if content_piece:
+                sys.stdout.write(content_piece)
+                sys.stdout.flush()
+        # Handle tool calls (one-shot: execute and append, then re-invoke once)
+        # Keep it simple: just print tool outputs inline
+        final = chunk  # last chunk has done info
+        if final.get('message', {}).get('tool_calls'):
+            for tc in final['message']['tool_calls']:
+                fn = tc.get('function', {}) if isinstance(tc, dict) else {}
+                tn = fn.get('name', '')
+                args = fn.get('arguments', {}) or {}
+                if not isinstance(args, dict):
+                    args = {}
+                if tn == 'run_shell':
+                    out = run_shell(args.get('command', ''))
+                    sys.stdout.write(f"\n\n[tool: {tn}]\n{out}\n")
+                elif tn == 'read_file':
+                    out = run_read_file(args.get('path', ''))
+                    sys.stdout.write(f"\n\n[tool: {tn}]\n{out}\n")
+                elif tn == 'web_search':
+                    out = run_web_search(args.get('query', ''))
+                    sys.stdout.write(f"\n\n[tool: {tn}]\n{out}\n")
+                elif tn == 'fetch_url':
+                    out = run_fetch_url(args.get('url', ''))
+                    sys.stdout.write(f"\n\n[tool: {tn}]\n{out}\n")
+                else:
+                    sys.stdout.write(f"\n\n[tool: {tn} — not supported in one-shot mode]\n")
+    except KeyboardInterrupt:
+        pass
+    sys.stdout.write('\n')
+    sys.exit(0)
+
+
 if __name__ == "__main__":
+    # Load user config (~/.loki.conf) before anything else.
+    _cfg = load_config()
+    if _cfg.get('model') and not os.environ.get('LOKI_MODEL'):
+        MODEL = _cfg['model']
+    if _cfg.get('persona') and _cfg['persona'] in PERSONAS:
+        ACTIVE_PERSONA = _cfg['persona']
+    if 'auto_approve' in _cfg:
+        stats['auto_approve'] = _cfg['auto_approve']
+    if 'auto_continue' in _cfg:
+        stats['auto_continue'] = _cfg['auto_continue']
+    if 'show_thinking' in _cfg:
+        stats['show_thinking'] = _cfg['show_thinking']
+    if _cfg.get('shell_timeout'):
+        SHELL_TIMEOUT = _cfg['shell_timeout']
+
+    # ── One-shot / pipe mode detection ────────────────────────────────────
+    # Parse argv for: loki "query", loki --exec "cmd" "query", piped stdin.
+    # Must happen before HW detection to allow fast scripted use.
+    _argv = sys.argv[1:]
+    _oneshot_query = None
+    _exec_cmd = None
+    _stdin_data = None
+
+    _i = 0
+    while _i < len(_argv):
+        if _argv[_i] in ('--exec', '-e') and _i + 1 < len(_argv):
+            _exec_cmd = _argv[_i + 1]
+            _i += 2
+        elif _argv[_i] in ('-y', '--yes', '-h', '--help'):
+            _i += 1  # handled by install.sh; skip silently
+        elif not _argv[_i].startswith('-'):
+            _oneshot_query = _argv[_i]
+            _i += 1
+        else:
+            _i += 1
+
+    if not sys.stdin.isatty():
+        _stdin_data = sys.stdin.read()
+        # Reopen stdin so prompt_toolkit can read the terminal (if needed)
+        try:
+            sys.stdin = open('/dev/tty', 'r')
+        except Exception:
+            pass
+
+    _is_oneshot = bool(_oneshot_query or _stdin_data or _exec_cmd)
+
+    # Load user plugins (~/.loki_plugins.py) — best-effort, never blocks boot.
+    _plugin_schema, _plugin_err = loki_plugins.load()
+    if _plugin_err:
+        sys.stderr.write(f"⚠  Plugin load error: {_plugin_err}\n")
+    elif _plugin_schema:
+        names = ', '.join(t['function']['name'] for t in _plugin_schema if 'function' in t)
+        sys.stderr.write(f"🔌 Plugins loaded: {names}\n")
+
     detect_max_ctx()
     # Probe HW e scelta del working_ctx iniziale: partiamo piccolo (default 8-16k)
     # invece di allocare KV cache per l'intero MAX_CTX. Se serve, _run_turn
     # bumpa al tier successivo quando il prompt supera l'80%.
     HW = loki_hw.detect_hardware()
-    stats['working_ctx'] = loki_hw.initial_working_ctx(MAX_CTX, HW['ram_avail_gb'])
+    stats['working_ctx'] = loki_hw.initial_working_ctx(
+        MAX_CTX, HW['ram_avail_gb'],
+        vram_free_gb=HW.get('vram_free_gb', 0.0),
+        gpu_kind=HW.get('gpu_kind', 'none'),
+    )
     # Pulizia una tantum di sessioni molto vecchie (skip _autosave e altri _*).
     try:
         loki_persist.prune_old_sessions(SESSIONS_DIR)
     except Exception:
         pass
     sys.stderr.write(loki_hw.hw_line(HW, stats['working_ctx'], MAX_CTX) + "\n")
+
+    # ── One-shot mode: skip UI entirely ──────────────────────────────────
+    if _is_oneshot:
+        run_oneshot(_oneshot_query, stdin_data=_stdin_data, exec_cmd=_exec_cmd)
+        # run_oneshot calls sys.exit — this line is never reached
+
     ui_mode   = os.environ.get('LOKI_UI', 'fullscreen').lower()
     exit_code = 0
     try:
-        if ui_mode == 'classic':
+        if ui_mode == 'web':
+            import loki_web
+            _port = int(os.environ.get('LOKI_PORT', '8080'))
+            _state = {'messages': [{"role": "system", "content": build_system_prompt()}]}
+            loki_web.run(_state, port=_port)
+        elif ui_mode == 'classic':
             asyncio.run(async_chat_loop())
         else:
             try:

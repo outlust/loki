@@ -150,10 +150,10 @@ step "4/9 · Prepare $LOKI_HOME and copy files"
 # ═══════════════════════════════════════════════════════════════════════
 mkdir -p "$LOKI_HOME"
 
-PY_FILES=(loki.py loki_hw.py loki_persist.py loki_mem.py)
+PY_FILES=(loki.py loki_hw.py loki_persist.py loki_mem.py loki_sec.py loki_web.py)
 # install.sh and uninstall.sh also land in LOKI_HOME so the user can
 # reinstall/uninstall later without keeping the original bundle around.
-AUX_FILES=(install.sh uninstall.sh)
+AUX_FILES=(install.sh uninstall.sh requirements.txt)
 if [ "$BUNDLE_DIR" != "$LOKI_HOME" ]; then
   for f in "${PY_FILES[@]}"; do
     if [ -f "$BUNDLE_DIR/$f" ]; then
@@ -167,8 +167,8 @@ if [ "$BUNDLE_DIR" != "$LOKI_HOME" ]; then
   for f in "${AUX_FILES[@]}"; do
     if [ -f "$BUNDLE_DIR/$f" ]; then
       cp "$BUNDLE_DIR/$f" "$LOKI_HOME/$f"
-      chmod +x "$LOKI_HOME/$f"
-      ok "copied $f (+x)"
+      [ "$f" != "requirements.txt" ] && chmod +x "$LOKI_HOME/$f"
+      ok "copied $f"
     fi
   done
 else
@@ -194,7 +194,11 @@ fi
 step "6/9 · Python dependencies (ollama, prompt_toolkit)"
 # ═══════════════════════════════════════════════════════════════════════
 "$VENV/bin/pip" install --quiet --upgrade pip
-"$VENV/bin/pip" install --quiet "ollama>=0.4" "prompt_toolkit>=3.0"
+if [ -f "$LOKI_HOME/requirements.txt" ]; then
+  "$VENV/bin/pip" install --quiet -r "$LOKI_HOME/requirements.txt"
+else
+  "$VENV/bin/pip" install --quiet "ollama>=0.3" "prompt_toolkit>=3.0"
+fi
 ok "dependencies installed"
 
 # ═══════════════════════════════════════════════════════════════════════

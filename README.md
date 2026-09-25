@@ -7,10 +7,14 @@ Loki is "light" in the sense that it adapts to the hardware it runs on: it detec
 ## Features
 
 - **Shell agent with per-command confirmation** (`manual` mode) or `auto approve`
+- **File tools**: `read_file` (partial reads, line ranges) and `write_file` (create/overwrite/append)
+- **Multiple personas** — `general`, `security`, `developer`, `sysadmin` — switchable live via `/persona`
+- **Live model switching** via `/model <name>` without restarting
+- **Config file** at `~/.loki.conf` for persistent defaults (model, persona, timeouts)
 - **Automatic context compression** at 80% of the current working ctx
 - **Per-turn autosave** to `~/.loki_sessions/_autosave.json` — no session is lost when the terminal dies
 - **Persistent memory** capped at 50 KB in `~/.loki_memory.md` (`/remember` for manual notes; end-of-session summaries added automatically)
-- **Saved sessions** via `/save`, interactive picker with `/resume`, `/clone`, `/delete`
+- **Saved sessions** via `/save`, interactive picker with `/resume`, `/clone`, `/delete`, `/search`
 - **Adaptive `num_ctx`** based on available RAM — the biggest footprint win
 - **`keep_alive=15m`** on Ollama so the model is not evicted between turns
 - **Contextual spinner**: `cooking...` while thinking, `bashing...` while executing shell
@@ -26,7 +30,7 @@ Loki is "light" in the sense that it adapts to the hardware it runs on: it detec
 ## Installation
 
 ```bash
-git clone https://github.com/<user>/loki.git
+git clone https://github.com/outlust/loki.git
 cd loki
 bash install.sh
 ```
@@ -48,11 +52,28 @@ LOKI_MODEL=qwen3:8b bash install.sh -y       # alternative model, no prompts
 
 Default model: `orcarouter/Qwen3.8-27B-Uncensored:latest` (~17 GB). Lighter alternatives: `qwen3:8b`, `qwen2.5:7b-instruct`, `llama3.1:8b`.
 
+## Config file
+
+Create `~/.loki.conf` to set persistent defaults:
+
+```ini
+[loki]
+model    = qwen3:8b
+persona  = developer
+auto_approve  = false
+shell_timeout = 60
+```
+
+All keys are optional. `LOKI_MODEL` env var still overrides `model`.
+
 ## Main slash commands
 
 | Command | What it does |
 |---|---|
 | `/help` | full list |
+| `/persona [name]` | show or switch persona (general/security/developer/sysadmin) |
+| `/tools` | list tools the model can call (run_shell, read_file, write_file) |
+| `/model [name]` | show model; with a name, switch models live |
 | `/hw` | show detected hardware + working ctx |
 | `/history` | session stats |
 | `/compress` | compress now instead of waiting for 80% |
@@ -61,17 +82,38 @@ Default model: `orcarouter/Qwen3.8-27B-Uncensored:latest` (~17 GB). Lighter alte
 | `/save [name]` | save the current session |
 | `/resume [name\|number]` | no arg opens the picker, with arg loads |
 | `/resume-last` | resume the autosave if < 12h old |
+| `/search <term>` | search saved sessions by keyword |
 | `/auto` / `/manual` | toggle auto-approve of commands |
 | `/think` | show/hide the thinking block |
 | `/img <path>` | attach an image to the next message |
 
+## Personas
+
+| Persona | Best for |
+|---|---|
+| `general` | everyday tasks, coding help, file management |
+| `security` | red team / offensive security / pen testing |
+| `developer` | code review, debugging, multi-language development |
+| `sysadmin` | server management, service config, automation |
+
+Switch at any time: `/persona developer`
+
+## Tools the model can use
+
+| Tool | Description |
+|---|---|
+| `run_shell` | Run any bash command; output returned to the model |
+| `read_file` | Read a file (supports `start_line`/`end_line` for large files) |
+| `write_file` | Write or append to a file (always asks for confirmation) |
+
 ## Layout
 
 ```
-loki-cli/
+loki/
 ├── install.sh          # from-zero installer (9 steps, idempotent)
 ├── uninstall.sh        # clean rollback
-├── loki.py             # prompt_toolkit UI + streaming + slash
+├── requirements.txt    # pip dependencies
+├── loki.py             # prompt_toolkit UI + streaming + slash commands
 ├── loki_hw.py          # HW probe + adaptive ctx (tiered)
 ├── loki_persist.py     # autosave/resume-last + session prune
 └── loki_mem.py         # capped memory file with rotation
@@ -89,6 +131,7 @@ $LOKI_HOME/              # default: ~/LOKI/
 
 ~/.loki_sessions/*.json  # user sessions (shared across installs)
 ~/.loki_memory.md        # persistent memory
+~/.loki.conf             # optional config file
 ```
 
 ## User data

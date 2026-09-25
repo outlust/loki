@@ -11,6 +11,7 @@ import threading
 import configparser
 import shutil
 from datetime import datetime
+import loki_plugins
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
@@ -321,7 +322,7 @@ _SEC_TOOLS = {
 }
 
 def get_active_tools():
-    """Return base tools; security persona also gets loki_sec tools."""
+    """Return base tools + security tools (if security persona) + user plugins."""
     schema = list(tools_schema)
     if ACTIVE_PERSONA == 'security':
         try:
@@ -329,6 +330,9 @@ def get_active_tools():
             schema.extend(loki_sec.SECURITY_TOOLS_SCHEMA)
         except ImportError:
             pass
+    # User-defined plugins always active, regardless of persona
+    if loki_plugins.tool_names():
+        schema.extend(loki_plugins._plugin_tools)
     return schema
 
 class SlashOnlyCompleter(Completer):
@@ -1405,9 +1409,49 @@ def _session_path(name):
     safe = re.sub(r'[^\w\-]', '_', name)
     return os.path.join(SESSIONS_DIR, f"{safe}.json")
 
-def save_session(messages, name=None):
+def _generate_session_title(messages):
+    """Ask the LLM for a 4-5 word dash-slug title. Falls back to timestamp."""
+    samples = []
+    for m in messages[1:]:
+        if m.get('role') in ('user', 'assistant') and m.get('content'):
+            samples.append(m['content'][:200])
+        if len(samples) >= 6:
+            break
+    if not samples:
+        return datetime.now().strftime("%Y%m%d_%H%M%S")
+    transcript = "\n".join(samples)
+    try:
+        resp = ollama.chat(
+            model=MODEL,
+            messages=[{"role": "user", "content": (
+                "Generate a 4-5 word title for this conversation. "
+                "Reply with ONLY the title: lowercase english words separated by dashes, "
+                "no punctuation, no quotes, no explanation.\n"
+                "Good examples: debug-nginx-timeout, setup-python-venv, analyze-auth-logs\n\n"
+                f"Conversation:\n{transcript}"
+            )}],
+            stream=False,
+            options={'num_ctx': 4096, 'num_predict': 20, 'temperature': 0.2},
+            keep_alive=KEEP_ALIVE,
+        )
+        raw = (resp.get('message', {}).get('content') or '').strip().lower()
+        slug = re.sub(r'[^\w\s-]', '', raw)
+        slug = re.sub(r'[\s_]+', '-', slug.strip())[:50]
+        if slug and re.search(r'[a-z]', slug):
+            return slug
+    except Exception:
+        pass
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def save_session(messages, name=None, auto_title=False):
     if not name:
-        name = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if auto_title and len(messages) > 2:
+            write(f"\n  {c('◎ generating title...', PURPLE)}  ")
+            name = _generate_session_title(messages)
+            write(f"\r  {c('◎ title:', PURPLE)} {c(name, ORANGE)}            \n")
+        else:
+            name = datetime.now().strftime("%Y%m%d_%H%M%S")
     payload = {
         'saved_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         'model':    MODEL,
@@ -1417,7 +1461,7 @@ def save_session(messages, name=None):
     path = _session_path(name)
     with open(path, 'w') as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
-    print(f"\n  {c('sessione salvata:', DIM)} {c(name, ORANGE)}  {c(path, DGRAY)}\n")
+    print(f"\n  {c('session saved:', DIM)} {c(name, ORANGE)}  {c(path, DGRAY)}\n")
     return name
 
 def _replay_message(m):
@@ -1684,7 +1728,8 @@ def parse_slash(text, messages=None):
         return 'handled', None
     if cmd == '/save':
         if messages:
-            save_session(messages, arg.strip() or None)
+            explicit = arg.strip()
+            save_session(messages, explicit or None, auto_title=not explicit)
         else:
             print(c("  nessun messaggio da salvare\n", DIM))
         return 'handled', None
@@ -2137,6 +2182,8 @@ def _run_turn(state):
                         output = sec_fn(**args)
                     except Exception as e:
                         output = f"ERROR calling {tool_name}: {e}"
+                elif tool_name in loki_plugins.tool_names():
+                    output = loki_plugins.dispatch(tool_name, args)
                 else:
                     output = f"ERROR: unknown tool: {tool_name}"
                 messages.append({"role": "tool", "content": output})
@@ -2901,6 +2948,91 @@ async def async_chat_loop_fullscreen():
     print(c("\n  Arrivederci.\n", DIM))
 
 
+def run_oneshot(query, stdin_data=None, exec_cmd=None):
+    """Non-interactive one-shot mode: process a single query and exit.
+
+    Handles three entry points:
+      loki "question"              → query from argv
+      echo "q" | loki             → query from piped stdin
+      loki --exec "cmd" "question" → run cmd first, inject output as context
+    """
+    # If --exec was given, run the command and prepend its output to the query
+    if exec_cmd:
+        try:
+            import subprocess as _sp
+            result = _sp.run(exec_cmd, shell=True, capture_output=True,
+                             text=True, timeout=SHELL_TIMEOUT)
+            exec_out = (result.stdout + result.stderr).strip()
+            if exec_out:
+                query = f"Command: {exec_cmd}\n\nOutput:\n{exec_out}\n\n{query or 'Analyze this output.'}"
+        except Exception as e:
+            query = f"Command failed: {exec_cmd}\nError: {e}\n\n{query or ''}"
+
+    # Prepend piped stdin to the query
+    if stdin_data:
+        query = f"{stdin_data.strip()}\n\n{query}" if query else stdin_data.strip()
+
+    if not query:
+        sys.stderr.write("loki: no query provided\n")
+        sys.exit(1)
+
+    messages = [
+        {"role": "system",  "content": build_system_prompt()},
+        {"role": "user",    "content": query},
+    ]
+
+    # Stream response directly to stdout (no fullscreen UI)
+    thinking_buf = []
+    show_think = os.environ.get('LOKI_THINK', '0') == '1'
+    try:
+        stream = ollama.chat(
+            model=MODEL,
+            messages=messages,
+            tools=get_active_tools(),
+            think=True,
+            stream=True,
+            options={'num_ctx': stats['working_ctx']},
+            keep_alive=KEEP_ALIVE,
+        )
+        in_thinking = False
+        for chunk in stream:
+            msg = chunk.get('message', {})
+            think_piece = msg.get('thinking') or ''
+            content_piece = msg.get('content') or ''
+            if think_piece:
+                in_thinking = True
+                thinking_buf.append(think_piece)
+            if in_thinking and not think_piece and content_piece:
+                in_thinking = False
+                if show_think and thinking_buf:
+                    sys.stdout.write(f"<think>\n{''.join(thinking_buf)}\n</think>\n\n")
+            if content_piece:
+                sys.stdout.write(content_piece)
+                sys.stdout.flush()
+        # Handle tool calls (one-shot: execute and append, then re-invoke once)
+        # Keep it simple: just print tool outputs inline
+        final = chunk  # last chunk has done info
+        if final.get('message', {}).get('tool_calls'):
+            for tc in final['message']['tool_calls']:
+                fn = tc.get('function', {}) if isinstance(tc, dict) else {}
+                tn = fn.get('name', '')
+                args = fn.get('arguments', {}) or {}
+                if not isinstance(args, dict):
+                    args = {}
+                if tn == 'run_shell':
+                    out = run_shell(args.get('command', ''))
+                    sys.stdout.write(f"\n\n[tool: {tn}]\n{out}\n")
+                elif tn == 'read_file':
+                    out = run_read_file(args.get('path', ''))
+                    sys.stdout.write(f"\n\n[tool: {tn}]\n{out}\n")
+                else:
+                    sys.stdout.write(f"\n\n[tool: {tn} — not supported in one-shot mode]\n")
+    except KeyboardInterrupt:
+        pass
+    sys.stdout.write('\n')
+    sys.exit(0)
+
+
 if __name__ == "__main__":
     # Load user config (~/.loki.conf) before anything else.
     _cfg = load_config()
@@ -2916,6 +3048,45 @@ if __name__ == "__main__":
         stats['show_thinking'] = _cfg['show_thinking']
     if _cfg.get('shell_timeout'):
         SHELL_TIMEOUT = _cfg['shell_timeout']
+
+    # ── One-shot / pipe mode detection ────────────────────────────────────
+    # Parse argv for: loki "query", loki --exec "cmd" "query", piped stdin.
+    # Must happen before HW detection to allow fast scripted use.
+    _argv = sys.argv[1:]
+    _oneshot_query = None
+    _exec_cmd = None
+    _stdin_data = None
+
+    _i = 0
+    while _i < len(_argv):
+        if _argv[_i] in ('--exec', '-e') and _i + 1 < len(_argv):
+            _exec_cmd = _argv[_i + 1]
+            _i += 2
+        elif _argv[_i] in ('-y', '--yes', '-h', '--help'):
+            _i += 1  # handled by install.sh; skip silently
+        elif not _argv[_i].startswith('-'):
+            _oneshot_query = _argv[_i]
+            _i += 1
+        else:
+            _i += 1
+
+    if not sys.stdin.isatty():
+        _stdin_data = sys.stdin.read()
+        # Reopen stdin so prompt_toolkit can read the terminal (if needed)
+        try:
+            sys.stdin = open('/dev/tty', 'r')
+        except Exception:
+            pass
+
+    _is_oneshot = bool(_oneshot_query or _stdin_data or _exec_cmd)
+
+    # Load user plugins (~/.loki_plugins.py) — best-effort, never blocks boot.
+    _plugin_schema, _plugin_err = loki_plugins.load()
+    if _plugin_err:
+        sys.stderr.write(f"⚠  Plugin load error: {_plugin_err}\n")
+    elif _plugin_schema:
+        names = ', '.join(t['function']['name'] for t in _plugin_schema if 'function' in t)
+        sys.stderr.write(f"🔌 Plugins loaded: {names}\n")
 
     detect_max_ctx()
     # Probe HW e scelta del working_ctx iniziale: partiamo piccolo (default 8-16k)
@@ -2933,6 +3104,12 @@ if __name__ == "__main__":
     except Exception:
         pass
     sys.stderr.write(loki_hw.hw_line(HW, stats['working_ctx'], MAX_CTX) + "\n")
+
+    # ── One-shot mode: skip UI entirely ──────────────────────────────────
+    if _is_oneshot:
+        run_oneshot(_oneshot_query, stdin_data=_stdin_data, exec_cmd=_exec_cmd)
+        # run_oneshot calls sys.exit — this line is never reached
+
     ui_mode   = os.environ.get('LOKI_UI', 'fullscreen').lower()
     exit_code = 0
     try:

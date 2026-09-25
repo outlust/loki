@@ -54,6 +54,7 @@ SHELL_TIMEOUT     = 30
 # Memory efficiency: trim old messages every turn (no LLM needed)
 TOOL_OUTPUT_KEEP_CHARS = 400   # chars kept in old tool outputs (head + tail)
 MAX_MESSAGES_BEFORE_COMPRESS = 60  # force compress when history grows this long
+MEMORY_INJECT_MAX_CHARS = 6000  # max chars of memory file injected into system prompt
 CONFIG_FILE = os.path.expanduser("~/.loki.conf")
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
@@ -744,22 +745,35 @@ def show_stats():
     elapsed = datetime.now() - stats['start_time']
     mins = int(elapsed.total_seconds() // 60)
     secs = int(elapsed.total_seconds() % 60)
+    age_h = elapsed.total_seconds() / 3600
     auto_state  = c('ON', GREEN) if stats['auto_approve']  else c('OFF', GRAY)
     think_state = c('ON', GREEN) if stats['show_thinking'] else c('OFF', GRAY)
     ac_state    = c('ON', GREEN) if stats['auto_continue'] else c('OFF', GRAY)
     print()
-    print(f"  {c('SESSIONE', BOLD)}")
-    print(f"    {c('durata', DIM):<20} {mins}m {secs}s")
-    print(f"    {c('messaggi', DIM):<20} {stats['messages']}")
-    print(f"    {c('comandi ok', DIM):<20} {c(str(stats['tools_ok']), GREEN)}")
-    print(f"    {c('comandi no', DIM):<20} {c(str(stats['tools_no']), RED)}")
-    print(f"    {c('auto approve', DIM):<20} {auto_state}")
-    print(f"    {c('mostra thinking', DIM):<20} {think_state}")
-    print(f"    {c('auto continue', DIM):<20} {ac_state}")
-    print(f"    {c('working ctx', DIM):<20} {stats['working_ctx']} / {MAX_CTX} tk")
+    print(f"  {c('SESSION', BOLD)}")
+    print(f"    {c('uptime', DIM):<22} {mins}m {secs}s", end='')
+    if age_h >= 1:
+        print(f"  {c('⚠ use /compress or /trim if lagging', YELLOW)}", end='')
+    print()
+    print(f"    {c('messages', DIM):<22} {stats['messages']}")
+    print(f"    {c('tools ok', DIM):<22} {c(str(stats['tools_ok']), GREEN)}")
+    print(f"    {c('tools failed', DIM):<22} {c(str(stats['tools_no']), RED)}")
+    print(f"    {c('auto approve', DIM):<22} {auto_state}")
+    print(f"    {c('show thinking', DIM):<22} {think_state}")
+    print(f"    {c('auto continue', DIM):<22} {ac_state}")
+    print(f"    {c('working ctx', DIM):<22} {stats['working_ctx']} / {MAX_CTX} tk")
     if stats['ctx_used']:
         pct = int(100 * stats['ctx_used'] / stats['working_ctx'])
-        print(f"    {c('ctx usato ultimo', DIM):<20} {stats['ctx_used']} tk ({pct}%)")
+        bar_filled = int(20 * pct / 100)
+        bar = '█' * bar_filled + '░' * (20 - bar_filled)
+        bar_color = RED if pct >= 70 else YELLOW if pct >= 45 else GREEN
+        print(f"    {c('ctx last turn', DIM):<22} {c(bar, bar_color)} {pct}%  ({stats['ctx_used']} tk)")
+    # Show memory file size
+    if os.path.isfile(MEMORY_FILE):
+        mem_kb = os.path.getsize(MEMORY_FILE) / 1024
+        mem_color = YELLOW if mem_kb > 30 else GREEN
+        print(f"    {c('memory file', DIM):<22} {c(f'{mem_kb:.1f} KB', mem_color)}"
+              f"  {c(f'(inject cap: {MEMORY_INJECT_MAX_CHARS//1000}k chars)', DIM)}")
     print()
 
 def _confirm_sync(command):
@@ -1139,6 +1153,10 @@ def build_system_prompt():
     except Exception:
         pass
     mem = load_memory()
+    if mem and len(mem) > MEMORY_INJECT_MAX_CHARS:
+        # Inject only the tail (most recent summaries) to cap system prompt size.
+        # Full file stays on disk; only token cost is reduced.
+        mem = f"[...older memory truncated: {len(mem) - MEMORY_INJECT_MAX_CHARS} chars...]\n\n" + mem[-MEMORY_INJECT_MAX_CHARS:]
     mem_section = f"\n\n## PERSISTENT MEMORY\n{mem}" if mem else ""
     return base + ops + think + workspace + mem_section + plan_section
 
@@ -2904,7 +2922,11 @@ if __name__ == "__main__":
     # invece di allocare KV cache per l'intero MAX_CTX. Se serve, _run_turn
     # bumpa al tier successivo quando il prompt supera l'80%.
     HW = loki_hw.detect_hardware()
-    stats['working_ctx'] = loki_hw.initial_working_ctx(MAX_CTX, HW['ram_avail_gb'])
+    stats['working_ctx'] = loki_hw.initial_working_ctx(
+        MAX_CTX, HW['ram_avail_gb'],
+        vram_free_gb=HW.get('vram_free_gb', 0.0),
+        gpu_kind=HW.get('gpu_kind', 'none'),
+    )
     # Pulizia una tantum di sessioni molto vecchie (skip _autosave e altri _*).
     try:
         loki_persist.prune_old_sessions(SESSIONS_DIR)

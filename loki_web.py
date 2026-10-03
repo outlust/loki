@@ -71,6 +71,84 @@ class WebOutputProxy:
         try:   return self._orig.fileno()
         except: return -1
 
+# ── Project helpers ──────────────────────────────────────────────────────────────
+def _project_payload():
+    try:
+        import loki as _l
+        import loki_projects
+        p = _l._active_project
+        all_p = [{"name": x['name'], "description": x.get('description',''),
+                  "mem_count": len(x.get('memory',{}))}
+                 for x in loki_projects.list_projects()]
+        return {
+            "type":        "project_state",
+            "active":      p['name'] if p else None,
+            "description": p.get('description','') if p else '',
+            "memory":      p.get('memory',{}) if p else {},
+            "projects":    all_p,
+        }
+    except Exception:
+        return {"type": "project_state", "active": None, "memory": {}, "projects": []}
+
+def _send_project_state():
+    _broadcast_sync(_project_payload())
+
+def _handle_project_action(msg: dict):
+    """Called from WS handler for project_action messages (sync, runs in executor)."""
+    import loki as _l
+    import loki_projects
+    action = msg.get('action','')
+    name   = (msg.get('name') or '').strip()
+    key    = (msg.get('key') or '').strip()
+    value  = (msg.get('value') or '').strip()
+
+    if action == 'list':
+        pass  # just send state
+
+    elif action == 'create':
+        if name:
+            existing = loki_projects.load(name)
+            _l._active_project = existing or loki_projects.create(name, msg.get('description',''))
+            if _state.get('messages') and _state['messages'][0]['role'] == 'system':
+                _state['messages'][0]['content'] = _l.build_system_prompt()
+
+    elif action == 'switch':
+        if name:
+            p = loki_projects.load(name)
+            if p:
+                _l._active_project = p
+                if _state.get('messages') and _state['messages'][0]['role'] == 'system':
+                    _state['messages'][0]['content'] = _l.build_system_prompt()
+
+    elif action == 'close':
+        _l._active_project = None
+        if _state.get('messages') and _state['messages'][0]['role'] == 'system':
+            _state['messages'][0]['content'] = _l.build_system_prompt()
+
+    elif action == 'set_mem':
+        if key and _l._active_project:
+            _l._active_project = loki_projects.set_mem(_l._active_project['name'], key, value)
+            if _state.get('messages') and _state['messages'][0]['role'] == 'system':
+                _state['messages'][0]['content'] = _l.build_system_prompt()
+
+    elif action == 'del_mem':
+        if key and _l._active_project:
+            loki_projects.del_mem(_l._active_project['name'], key)
+            _l._active_project = loki_projects.load(_l._active_project['name']) or _l._active_project
+            if _state.get('messages') and _state['messages'][0]['role'] == 'system':
+                _state['messages'][0]['content'] = _l.build_system_prompt()
+
+    elif action == 'delete':
+        if name:
+            loki_projects.delete(name)
+            if _l._active_project and _l._active_project['name'] == name:
+                _l._active_project = None
+                if _state.get('messages') and _state['messages'][0]['role'] == 'system':
+                    _state['messages'][0]['content'] = _l.build_system_prompt()
+
+    _send_project_state()
+
+
 # ── Stats ────────────────────────────────────────────────────────────────────────
 def _send_stats():
     try:
@@ -103,6 +181,7 @@ def _do_turn(text: str):
             _state['messages'] = payload
         elif action == 'compress':
             _state['messages'] = _l.compress_context(_state['messages'])
+        _send_project_state()
         return
     _l.stats['messages'] += 1
     _state['messages'].append({"role": "user", "content": text})
@@ -132,6 +211,7 @@ async def _handle_input(text: str, sender=None):
         _pending.clear()
         await _broadcast({"type": "processing", "value": False})
         _send_stats()
+        _send_project_state()
 
 # ── WebSocket handler ────────────────────────────────────────────────────────────
 async def _ws_handler(request):
@@ -143,6 +223,7 @@ async def _ws_handler(request):
     if _history:
         await ws.send_str(json.dumps({"type": "history", "events": _history}))
     _send_stats()
+    _send_project_state()
 
     try:
         async for raw in ws:
@@ -163,6 +244,9 @@ async def _ws_handler(request):
                 # Broadcast user event to other clients only (sender shows it locally)
                 loop.create_task(_broadcast(ev, skip=ws))
                 loop.create_task(_handle_input(text, sender=ws))
+            elif t == "project_action":
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, _handle_project_action, msg)
             elif t == "confirm_response":
                 _confirm_ok[0] = bool(msg.get("approved"))
                 _confirm_ev.set()
@@ -388,6 +472,102 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
 #bno{background:var(--bg3);color:var(--text2);border:1px solid var(--border)}
 #bno:hover{color:var(--text)}
 
+/* ── Projects panel ── */
+#proj-btn{
+  flex-shrink:0;background:none;border:1px solid var(--border);
+  border-radius:4px;color:var(--text2);font-family:var(--mono);font-size:11px;
+  padding:4px 9px;cursor:pointer;display:flex;align-items:center;gap:5px;
+  white-space:nowrap;transition:border-color .15s,color .15s;
+}
+#proj-btn:hover{border-color:var(--accent);color:var(--text)}
+#proj-btn.active{border-color:var(--accent2);color:var(--accent2)}
+#proj-dot{width:6px;height:6px;border-radius:50%;background:var(--dim);flex-shrink:0;transition:background .3s}
+#proj-dot.on{background:var(--accent2)}
+
+#proj-panel{
+  position:fixed;top:0;right:0;bottom:0;
+  width:min(360px,100vw);
+  background:var(--bg2);border-left:1px solid var(--border);
+  display:flex;flex-direction:column;
+  transform:translateX(100%);transition:transform .25s ease;
+  z-index:90;
+}
+#proj-panel.open{transform:translateX(0)}
+
+#pp-hdr{
+  background:var(--bg3);border-bottom:1px solid var(--border);
+  padding:12px 16px;display:flex;align-items:center;gap:8px;flex-shrink:0;
+}
+#pp-hdr-title{color:var(--accent2);font-size:13px;font-weight:700;letter-spacing:1px;flex:1}
+#pp-close{
+  background:none;border:none;color:var(--text2);cursor:pointer;
+  font-size:18px;padding:2px 6px;border-radius:3px;
+}
+#pp-close:hover{color:var(--text)}
+
+#pp-body{flex:1;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:16px}
+#pp-body::-webkit-scrollbar{width:2px}
+#pp-body::-webkit-scrollbar-thumb{background:var(--border)}
+
+.pp-section-title{color:var(--text2);font-size:10px;letter-spacing:1px;margin-bottom:6px;text-transform:uppercase}
+
+/* Active project card */
+#pp-active{background:var(--bg3);border:1px solid var(--accent);border-radius:var(--r);padding:12px}
+#pp-active-name{color:var(--accent2);font-size:14px;font-weight:700;margin-bottom:3px}
+#pp-active-desc{color:var(--text2);font-size:11px;margin-bottom:10px;min-height:14px}
+#pp-no-project{color:var(--dim);font-size:12px;font-style:italic}
+
+/* Memory table */
+#pp-mem-list{display:flex;flex-direction:column;gap:4px}
+.mem-row{
+  background:var(--tool-bg);border:1px solid var(--border);border-radius:3px;
+  padding:6px 10px;display:flex;align-items:flex-start;gap:8px;
+}
+.mem-key{color:var(--accent2);font-size:12px;flex-shrink:0;min-width:100px;word-break:break-word}
+.mem-val{color:var(--text);font-size:12px;flex:1;word-break:break-word}
+.mem-del{
+  background:none;border:none;color:var(--dim);cursor:pointer;font-size:14px;
+  padding:0 2px;flex-shrink:0;transition:color .15s;
+}
+.mem-del:hover{color:var(--red)}
+.mem-empty{color:var(--dim);font-size:11px;font-style:italic}
+
+/* Add memory form */
+#pp-add-form{display:flex;flex-direction:column;gap:6px}
+.pp-input{
+  background:var(--bg3);border:1px solid var(--border);border-radius:3px;
+  color:var(--text);font-family:var(--mono);font-size:12px;
+  padding:7px 10px;outline:none;width:100%;
+  transition:border-color .15s;
+}
+.pp-input:focus{border-color:var(--accent)}
+.pp-input::placeholder{color:var(--dim)}
+#pp-add-btn{
+  background:var(--accent);color:var(--text);border:none;border-radius:3px;
+  font-family:var(--mono);font-size:12px;padding:7px 14px;cursor:pointer;align-self:flex-end;
+}
+#pp-add-btn:hover{background:var(--accent2)}
+
+/* Projects list */
+#pp-proj-list{display:flex;flex-direction:column;gap:4px}
+.proj-row{
+  background:var(--tool-bg);border:1px solid var(--border);border-radius:3px;
+  padding:8px 10px;display:flex;align-items:center;gap:8px;cursor:pointer;
+  transition:border-color .15s;
+}
+.proj-row:hover{border-color:var(--accent)}
+.proj-row.current{border-color:var(--accent2)}
+.proj-row-name{color:var(--text);font-size:12px;font-weight:600;flex:1}
+.proj-row-desc{color:var(--text2);font-size:10px}
+.proj-row-mem{color:var(--dim);font-size:10px;flex-shrink:0}
+.proj-del-btn{
+  background:none;border:none;color:var(--dim);cursor:pointer;font-size:13px;padding:0 3px;
+}
+.proj-del-btn:hover{color:var(--red)}
+
+/* New project form */
+#pp-new-form{display:flex;flex-direction:column;gap:6px}
+
 /* ── Mobile tweaks ── */
 @media(max-width:480px){
   .m-user,.m-ai{max-width:100%}
@@ -404,6 +584,10 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
     <span id="conn-dot"></span>
     <span id="conn-txt">connessione...</span>
     <div id="busy"><div class="spin"></div><span id="busy-txt">elaborando</span></div>
+    <button id="proj-btn" title="Progetti" onclick="togglePanel()">
+      <span id="proj-dot"></span>
+      <span id="proj-label">progetti</span>
+    </button>
   </div>
 
   <div id="msgs"></div>
@@ -425,6 +609,62 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
 </div>
 
 <div id="scrollbtn" title="Scorri in basso">↓</div>
+
+<!-- Projects panel -->
+<div id="proj-panel">
+  <div id="pp-hdr">
+    <span id="pp-hdr-title">◈ PROGETTI</span>
+    <button id="pp-close" onclick="togglePanel()">✕</button>
+  </div>
+  <div id="pp-body">
+
+    <!-- Active project -->
+    <div>
+      <div class="pp-section-title">Progetto attivo</div>
+      <div id="pp-active">
+        <div id="pp-no-project">Nessun progetto attivo</div>
+        <div id="pp-active-name" style="display:none"></div>
+        <div id="pp-active-desc"></div>
+        <!-- Memory -->
+        <div id="pp-mem-section" style="display:none">
+          <div class="pp-section-title" style="margin-top:10px">Memoria</div>
+          <div id="pp-mem-list"></div>
+          <!-- Add key-value -->
+          <div id="pp-add-form" style="margin-top:8px">
+            <input id="pp-key" class="pp-input" placeholder="chiave" autocomplete="off">
+            <input id="pp-val" class="pp-input" placeholder="valore" autocomplete="off">
+            <button id="pp-add-btn" onclick="addMem()">+ Salva</button>
+          </div>
+        </div>
+        <!-- Close project -->
+        <button id="pp-close-proj" onclick="wsSend({type:'project_action',action:'close'})"
+          style="display:none;margin-top:10px;background:none;border:1px solid var(--border);
+                 color:var(--text2);font-family:var(--mono);font-size:11px;padding:5px 10px;
+                 border-radius:3px;cursor:pointer;width:100%">
+          Chiudi progetto
+        </button>
+      </div>
+    </div>
+
+    <!-- All projects -->
+    <div>
+      <div class="pp-section-title">Tutti i progetti</div>
+      <div id="pp-proj-list"></div>
+      <!-- New project form -->
+      <div id="pp-new-form" style="margin-top:8px">
+        <input id="pp-new-name" class="pp-input" placeholder="nome nuovo progetto" autocomplete="off">
+        <input id="pp-new-desc" class="pp-input" placeholder="descrizione (opzionale)" autocomplete="off">
+        <button id="pp-add-btn" onclick="createProject()"
+          style="background:var(--bg3);border:1px solid var(--border);color:var(--text2);
+                 font-family:var(--mono);font-size:12px;padding:7px 14px;border-radius:3px;
+                 cursor:pointer;align-self:flex-end">
+          + Crea progetto
+        </button>
+      </div>
+    </div>
+
+  </div>
+</div>
 
 <div id="overlay">
   <div id="modal">
@@ -594,6 +834,9 @@ function handle(msg) {
     case 'stats':
       applyStats(msg)
       break
+    case 'project_state':
+      applyProjectState(msg)
+      break
   }
 }
 
@@ -660,6 +903,141 @@ inp.addEventListener('input', () => {
   inp.style.height = Math.min(inp.scrollHeight,160)+'px'
 })
 sbtn.onclick = submit
+
+/* ── Projects panel ── */
+let _projState = {active: null, memory: {}, projects: []}
+
+function togglePanel() {
+  const p = $('proj-panel')
+  p.classList.toggle('open')
+  $('proj-btn').classList.toggle('active', p.classList.contains('open'))
+}
+
+function applyProjectState(s) {
+  _projState = s
+
+  // Header button
+  const dot = $('proj-dot'), lbl = $('proj-label')
+  if (s.active) {
+    dot.className = 'on'
+    lbl.textContent = s.active.length > 14 ? s.active.slice(0,13)+'…' : s.active
+  } else {
+    dot.className = ''
+    lbl.textContent = 'progetti'
+  }
+
+  // Active card
+  const noProj = $('pp-no-project')
+  const nameEl = $('pp-active-name')
+  const descEl = $('pp-active-desc')
+  const memSec = $('pp-mem-section')
+  const closeBtn = $('pp-close-proj')
+
+  if (s.active) {
+    noProj.style.display = 'none'
+    nameEl.style.display = 'block'
+    nameEl.textContent = s.active
+    descEl.textContent = s.description || ''
+    memSec.style.display = 'block'
+    closeBtn.style.display = 'block'
+    renderMemory(s.memory || {})
+  } else {
+    noProj.style.display = 'block'
+    nameEl.style.display = 'none'
+    descEl.textContent = ''
+    memSec.style.display = 'none'
+    closeBtn.style.display = 'none'
+  }
+
+  // Projects list
+  renderProjectsList(s.projects || [])
+}
+
+function renderMemory(mem) {
+  const list = $('pp-mem-list')
+  list.innerHTML = ''
+  const keys = Object.keys(mem)
+  if (!keys.length) {
+    list.innerHTML = '<div class="mem-empty">Nessuna chiave salvata</div>'
+    return
+  }
+  for (const k of keys) {
+    const row = document.createElement('div')
+    row.className = 'mem-row'
+    row.innerHTML = `
+      <span class="mem-key">${esc(k)}</span>
+      <span class="mem-val">${esc(String(mem[k]))}</span>
+      <button class="mem-del" title="Rimuovi" onclick="delMem('${esc(k).replace(/'/g,"\\'")}')">✕</button>
+    `
+    list.appendChild(row)
+  }
+}
+
+function renderProjectsList(projects) {
+  const list = $('pp-proj-list')
+  list.innerHTML = ''
+  if (!projects.length) {
+    list.innerHTML = '<div class="mem-empty">Nessun progetto</div>'
+    return
+  }
+  for (const p of projects) {
+    const row = document.createElement('div')
+    row.className = 'proj-row' + (_projState.active === p.name ? ' current' : '')
+    row.innerHTML = `
+      <div style="flex:1" onclick="switchProject('${esc(p.name).replace(/'/g,"\\'")}')">
+        <div class="proj-row-name">${esc(p.name)}</div>
+        ${p.description ? `<div class="proj-row-desc">${esc(p.description)}</div>` : ''}
+      </div>
+      <span class="proj-row-mem">${p.mem_count} chiavi</span>
+      <button class="proj-del-btn" title="Elimina" onclick="deleteProject('${esc(p.name).replace(/'/g,"\\'")}')">✕</button>
+    `
+    list.appendChild(row)
+  }
+}
+
+function switchProject(name) {
+  wsSend({type:'project_action', action:'switch', name})
+}
+
+function createProject() {
+  const name = $('pp-new-name').value.trim()
+  const desc = $('pp-new-desc').value.trim()
+  if (!name) { $('pp-new-name').focus(); return }
+  wsSend({type:'project_action', action:'create', name, description: desc})
+  $('pp-new-name').value = ''
+  $('pp-new-desc').value = ''
+}
+
+function addMem() {
+  const k = $('pp-key').value.trim()
+  const v = $('pp-val').value.trim()
+  if (!k || !v) { (!k ? $('pp-key') : $('pp-val')).focus(); return }
+  wsSend({type:'project_action', action:'set_mem', key: k, value: v})
+  $('pp-key').value = ''
+  $('pp-val').value = ''
+}
+
+function delMem(key) {
+  wsSend({type:'project_action', action:'del_mem', key})
+}
+
+function deleteProject(name) {
+  if (!confirm(`Eliminare il progetto "${name}"?`)) return
+  wsSend({type:'project_action', action:'delete', name})
+}
+
+// Enter key on new-project inputs
+$('pp-new-name').addEventListener('keydown', e => { if(e.key==='Enter') $('pp-new-desc').focus() })
+$('pp-new-desc').addEventListener('keydown', e => { if(e.key==='Enter') createProject() })
+$('pp-key').addEventListener('keydown', e => { if(e.key==='Enter') $('pp-val').focus() })
+$('pp-val').addEventListener('keydown', e => { if(e.key==='Enter') addMem() })
+
+// Close panel on backdrop click (mobile)
+document.addEventListener('click', e => {
+  const panel = $('proj-panel')
+  if (panel.classList.contains('open') && !panel.contains(e.target) && e.target !== $('proj-btn') && !$('proj-btn').contains(e.target))
+    panel.classList.remove('open')
+})
 
 connect()
 inp.focus()

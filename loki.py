@@ -176,6 +176,7 @@ SLASH_COMMANDS = {
 }
 
 _web_confirm_fn = None   # set by loki_web.run() when LOKI_UI=web
+_active_project: dict | None = None  # set by /project switch
 
 stats = {
     'start_time':    datetime.now(),
@@ -278,6 +279,43 @@ tools_schema = [
                     "url": {"type": "string", "description": "Full URL to fetch (https://...)"}
                 },
                 "required": ["url"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remember",
+            "description": (
+                "Save a key-value fact to the active project's persistent memory. "
+                "Use this whenever the user tells you something important that should survive across sessions "
+                "(preferences, credentials patterns, repo paths, recurring config, etc.). "
+                "Stored facts are injected into your system prompt next session — never re-derive them."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "key":   {"type": "string", "description": "Short snake_case key (e.g. 'preferred_lang', 'db_host')"},
+                    "value": {"type": "string", "description": "Value to persist"}
+                },
+                "required": ["key", "value"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "recall",
+            "description": (
+                "Retrieve a value from the active project's persistent memory by key. "
+                "Use when you need to look up something you previously stored."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string", "description": "The key to look up"}
+                },
+                "required": ["key"]
             }
         }
     },
@@ -1254,7 +1292,16 @@ def build_system_prompt():
         # Full file stays on disk; only token cost is reduced.
         mem = f"[...older memory truncated: {len(mem) - MEMORY_INJECT_MAX_CHARS} chars...]\n\n" + mem[-MEMORY_INJECT_MAX_CHARS:]
     mem_section = f"\n\n## PERSISTENT MEMORY\n{mem}" if mem else ""
-    return base + ops + think + workspace + mem_section + plan_section
+    proj_section = ""
+    if _active_project:
+        try:
+            import loki_projects
+            blk = loki_projects.memory_block(_active_project)
+            if blk:
+                proj_section = f"\n\n{blk}"
+        except Exception:
+            pass
+    return base + ops + think + workspace + mem_section + plan_section + proj_section
 
 def _find_turn_start(messages, idx):
     """Sposta idx all'indietro finche non atterra su un messaggio 'user'.
@@ -1649,6 +1696,146 @@ def resume_session(arg, messages):
 
     return messages[:1] + loaded  # system prompt + messaggi ripresi
 
+def _handle_project_cmd(arg: str, messages):
+    """Gestisce tutti i sottocomandi di /project."""
+    global _active_project
+    import loki_projects
+
+    parts = arg.split(maxsplit=1)
+    sub   = parts[0].lower() if parts else ''
+    rest  = parts[1].strip() if len(parts) > 1 else ''
+
+    def _refresh_sysprompt():
+        if messages and messages[0]['role'] == 'system':
+            messages[0]['content'] = build_system_prompt()
+
+    if not sub or sub == 'info':
+        if not _active_project:
+            print(c("  nessun progetto attivo — usa /project new <nome>\n", GRAY))
+        else:
+            p = _active_project
+            print(f"\n  {c('◈ Progetto:', BOLD)} {c(p['name'], ORANGE)}")
+            if p.get('description'):
+                print(f"  {c(p['description'], GRAY)}")
+            mem = p.get('memory', {})
+            if mem:
+                print(f"\n  {c('Memoria:', BOLD)}")
+                for k, v in mem.items():
+                    print(f"    {c(k, CYAN)}: {v}")
+            else:
+                print(f"  {c('memoria vuota', DIM)}")
+            print()
+        return 'handled', None
+
+    if sub == 'list':
+        projects = loki_projects.list_projects()
+        if not projects:
+            print(c("  nessun progetto — /project new <nome>\n", GRAY))
+        else:
+            print(f"\n  {c('PROGETTI', BOLD)}")
+            for p in projects:
+                marker = c('►', ORANGE) if (_active_project and p['name'] == _active_project['name']) else ' '
+                n_mem  = len(p.get('memory', {}))
+                print(f"    {marker} {c(p['name'], BOLD):<24} {c(p.get('description',''), GRAY)[:50]}  {c(f'{n_mem} chiavi', DIM)}")
+            print()
+        return 'handled', None
+
+    if sub == 'new':
+        name_desc = rest.split(':', 1)
+        name = name_desc[0].strip()
+        desc = name_desc[1].strip() if len(name_desc) > 1 else ''
+        if not name:
+            print(c("  uso: /project new <nome>[: descrizione]\n", GRAY))
+            return 'handled', None
+        existing = loki_projects.load(name)
+        if existing:
+            _active_project = existing
+            print(f"  {c('progetto esistente caricato:', DIM)} {c(name, ORANGE)}\n")
+        else:
+            _active_project = loki_projects.create(name, desc)
+            print(f"  {c('◈ progetto creato:', GREEN)} {c(name, ORANGE)}\n")
+        _refresh_sysprompt()
+        return 'handled', None
+
+    if sub in ('switch', 'load', 'use'):
+        if not rest:
+            print(c("  uso: /project switch <nome>\n", GRAY))
+            return 'handled', None
+        p = loki_projects.load(rest)
+        if not p:
+            print(c(f"  progetto '{rest}' non trovato — /project new {rest}\n", RED))
+            return 'handled', None
+        _active_project = p
+        n_mem = len(p.get('memory', {}))
+        print(f"  {c('◈ progetto attivo:', GREEN)} {c(rest, ORANGE)}  {c(f'{n_mem} chiavi in memoria', DIM)}\n")
+        _refresh_sysprompt()
+        return 'handled', None
+
+    if sub == 'set':
+        kv = rest.split('=', 1) if '=' in rest else rest.split(maxsplit=1)
+        if len(kv) < 2 or not kv[0].strip():
+            print(c("  uso: /project set <chiave> <valore>  oppure  <chiave>=<valore>\n", GRAY))
+            return 'handled', None
+        if not _active_project:
+            print(c("  nessun progetto attivo — /project new <nome>\n", RED))
+            return 'handled', None
+        k, v = kv[0].strip(), kv[1].strip()
+        _active_project = loki_projects.set_mem(_active_project['name'], k, v)
+        print(f"  {c('✓', GREEN)} {c(k, CYAN)} = {v}\n")
+        _refresh_sysprompt()
+        return 'handled', None
+
+    if sub in ('del', 'unset', 'rm'):
+        if not rest:
+            print(c("  uso: /project del <chiave>\n", GRAY))
+            return 'handled', None
+        if not _active_project:
+            print(c("  nessun progetto attivo\n", RED))
+            return 'handled', None
+        ok = loki_projects.del_mem(_active_project['name'], rest)
+        if ok:
+            _active_project = loki_projects.load(_active_project['name']) or _active_project
+            print(f"  {c('✓ chiave rimossa:', GREEN)} {rest}\n")
+            _refresh_sysprompt()
+        else:
+            print(c(f"  chiave '{rest}' non trovata\n", GRAY))
+        return 'handled', None
+
+    if sub == 'delete':
+        if not rest:
+            print(c("  uso: /project delete <nome>\n", GRAY))
+            return 'handled', None
+        ok = loki_projects.delete(rest)
+        if ok:
+            if _active_project and _active_project['name'] == rest:
+                _active_project = None
+                _refresh_sysprompt()
+            print(f"  {c('✓ progetto eliminato:', GREEN)} {rest}\n")
+        else:
+            print(c(f"  progetto '{rest}' non trovato\n", GRAY))
+        return 'handled', None
+
+    if sub == 'close':
+        _active_project = None
+        _refresh_sysprompt()
+        print(c("  progetto chiuso\n", GRAY))
+        return 'handled', None
+
+    # Fallback: help
+    print(f"""
+  {c('COMANDI PROGETTO', BOLD)}
+    {c('/project', ORANGE)}              → info progetto attivo + memoria
+    {c('/project list', ORANGE)}         → lista tutti i progetti
+    {c('/project new <nome>[: desc]', ORANGE)} → crea e attiva progetto
+    {c('/project switch <nome>', ORANGE)} → attiva progetto esistente
+    {c('/project set <k> <v>', ORANGE)}  → salva chiave-valore in memoria
+    {c('/project del <k>', ORANGE)}      → rimuovi chiave dalla memoria
+    {c('/project delete <nome>', ORANGE)} → elimina progetto
+    {c('/project close', ORANGE)}        → disattiva progetto corrente
+""")
+    return 'handled', None
+
+
 def parse_slash(text, messages=None):
     parts = text.strip().split(maxsplit=1)
     cmd = parts[0].lower()
@@ -1752,6 +1939,8 @@ def parse_slash(text, messages=None):
         state = c('ON', GREEN) if stats['show_thinking'] else c('OFF', GRAY)
         print(f"  {c('mostra thinking:', DIM)} {state}\n")
         return 'handled', None
+    if cmd == '/project':
+        return _handle_project_cmd(arg.strip(), messages)
     if cmd in ('/history', '/cost'):
         show_stats()
         return 'handled', None
@@ -2269,6 +2458,21 @@ def _run_turn(state):
                     output = run_web_search(args.get('query', ''))
                 elif tool_name == 'fetch_url':
                     output = run_fetch_url(args.get('url', ''))
+                elif tool_name == 'remember':
+                    if _active_project:
+                        import loki_projects
+                        _active_project = loki_projects.set_mem(
+                            _active_project['name'], args.get('key',''), args.get('value',''))
+                        output = f"✓ Memorizzato: {args.get('key')} = {args.get('value')}"
+                    else:
+                        output = "Nessun progetto attivo. Usa /project new <nome> per crearne uno."
+                elif tool_name == 'recall':
+                    if _active_project:
+                        val = _active_project['memory'].get(args.get('key',''))
+                        output = (f"{args.get('key')}: {val}" if val
+                                  else f"Chiave '{args.get('key')}' non trovata in memoria del progetto.")
+                    else:
+                        output = "Nessun progetto attivo."
                 elif tool_name == 'workspace_write':
                     output = run_workspace_write(
                         args.get('file', ''),

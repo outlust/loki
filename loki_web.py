@@ -1,116 +1,103 @@
-"""Loki Web UI — aiohttp + WebSocket server.
-
-Avvio:  LOKI_UI=web loki.sh          (porta default 8080)
-        LOKI_PORT=9090 LOKI_UI=web loki.sh
-Accesso: http://<tailscale-ip>:<porta>   — nessun dominio necessario
-
-Richiede: pip install aiohttp  (aggiunto in requirements.txt)
+"""Loki Web Server v2
+Multi-client aiohttp + WebSocket, history replay, mobile-first UI.
+Start: LOKI_UI=web [LOKI_PORT=8080] python loki.py
 """
+import asyncio, json, re, sys, threading, time
+from datetime import datetime
 
-import asyncio
-import json
-import os
-import re
-import sys
-import threading
+# ── ANSI stripping ──────────────────────────────────────────────────────────────
+_ANSI = re.compile(r'\033(?:\[[0-9;]*[mKHJA-Za-z]|\][^\x07]*\x07|.)')
+def _strip(s: str) -> str:
+    return _ANSI.sub('', s)
 
-_ANSI_RE = re.compile(r'\033\[[0-9;]*[mKHJA-Za-z]|\033\].*?\x07')
-_ws_clients: set = set()
-_main_loop = None   # asyncio event loop, settato da run()
+# ── Globals ─────────────────────────────────────────────────────────────────────
+_ws_clients: set  = set()
+_main_loop        = None
+_history: list    = []   # [{type,text|data,ts}, …]  — user + ai_turn + sys only
+_pending: list    = []   # accumulates AI output chunks during a turn
+_state: dict      = {}
+_lock             = threading.Lock()
 
-# ── Confirm mechanism (thread-safe) ──────────────────────────────────────────
-_confirm_event  = threading.Event()
-_confirm_result = [False]
-
+# ── Confirm bridge (sync executor → async WS) ───────────────────────────────────
+_confirm_ev = threading.Event()
+_confirm_ok = [False]
 
 def confirm_web(command: str) -> bool:
-    """Inviato dal thread executor. Mostra modal nel browser e attende risposta."""
-    _confirm_event.clear()
-    _confirm_result[0] = False
+    _confirm_ev.clear()
+    _confirm_ok[0] = False
     _broadcast_sync({"type": "confirm", "command": command})
-    _confirm_event.wait(timeout=300)  # 5 minuti
-    return _confirm_result[0]
+    _confirm_ev.wait(timeout=300)
+    return _confirm_ok[0]
 
+# ── Broadcast helpers ───────────────────────────────────────────────────────────
+def _broadcast_sync(msg: dict):
+    """Call from any thread."""
+    if _main_loop and _ws_clients:
+        asyncio.run_coroutine_threadsafe(_broadcast(msg), _main_loop)
 
-# ── WebOutputProxy ────────────────────────────────────────────────────────────
+async def _broadcast(msg: dict, skip=None):
+    data = json.dumps(msg, ensure_ascii=False)
+    dead = set()
+    for ws in list(_ws_clients):
+        if ws is skip:
+            continue
+        try:
+            await ws.send_str(data)
+        except Exception:
+            dead.add(ws)
+    _ws_clients.difference_update(dead)
+
+# ── Output proxy ────────────────────────────────────────────────────────────────
 class WebOutputProxy:
-    """Intercetta sys.stdout, rimuove ANSI, manda testo al browser via WS."""
     def __init__(self, orig):
         self._orig = orig
 
     def write(self, text):
         if isinstance(text, bytes):
             text = text.decode('utf-8', errors='replace')
-        clean = _ANSI_RE.sub('', text)
+        clean = _strip(text)
         if '\r' in clean:
-            # Progress bars: tieni solo dopo l'ultimo \r
             clean = clean.split('\r')[-1]
         if clean.strip('\n'):
+            if _lock.locked():
+                _pending.append(clean)
             _broadcast_sync({"type": "out", "text": clean})
         return len(text)
 
     def flush(self): pass
     def isatty(self): return False
     def writable(self): return True
-
     def fileno(self):
-        try:
-            return self._orig.fileno()
-        except Exception:
-            return -1
+        try:   return self._orig.fileno()
+        except: return -1
 
-
-# ── Broadcast ─────────────────────────────────────────────────────────────────
-def _broadcast_sync(msg: dict):
-    if _main_loop is None or not _ws_clients:
-        return
-    asyncio.run_coroutine_threadsafe(_broadcast_async(msg), _main_loop)
-
-
-async def _broadcast_async(msg: dict):
-    txt = json.dumps(msg, ensure_ascii=False)
-    dead = set()
-    for ws in list(_ws_clients):
-        try:
-            await ws.send_str(txt)
-        except Exception:
-            dead.add(ws)
-    for d in dead:
-        _ws_clients.discard(d)
-
-
-# ── State & processing ────────────────────────────────────────────────────────
-_state: dict = {}
-_processing_lock = threading.Lock()
-
-
+# ── Stats ────────────────────────────────────────────────────────────────────────
 def _send_stats():
     try:
         import loki as _l
-        ctx_pct = (int(100 * _l.stats['ctx_used'] / _l.stats['working_ctx'])
-                   if _l.stats.get('ctx_used') and _l.stats.get('working_ctx') else 0)
+        cu = _l.stats.get('ctx_used', 0) or 0
+        wc = _l.stats.get('working_ctx', 1) or 1
         _broadcast_sync({
-            "type": "stats",
-            "model":    _l.MODEL.split('/')[-1][:32],
-            "messages": _l.stats['messages'],
-            "ctx_pct":  ctx_pct,
-            "working_ctx": _l.stats['working_ctx'],
-            "uptime":   int((
-                __import__('datetime').datetime.now() - _l.stats['start_time']
-            ).total_seconds()),
+            "type":    "stats",
+            "model":   _l.MODEL.split('/')[-1][:36],
+            "msgs":    _l.stats.get('messages', 0),
+            "ctx_pct": int(100 * cu / wc) if cu else 0,
+            "uptime":  int((datetime.now() - _l.stats['start_time']).total_seconds()),
         })
     except Exception:
         pass
 
-
+# ── Turn execution ───────────────────────────────────────────────────────────────
 def _do_turn(text: str):
     import loki as _l
     if text.startswith('/'):
         action, payload = _l.parse_slash(text, _state['messages'])
         if action == 'exit':
+            _history.clear()
             _broadcast_sync({"type": "server_exit"})
         elif action == 'clear':
             _state['messages'] = _state['messages'][:1]
+            _history.clear()
             _broadcast_sync({"type": "clear"})
         elif action in ('resume', 'trim'):
             _state['messages'] = payload
@@ -121,14 +108,42 @@ def _do_turn(text: str):
     _state['messages'].append({"role": "user", "content": text})
     _l._run_turn(_state)
 
+async def _handle_input(text: str, sender=None):
+    if not _lock.acquire(blocking=False):
+        if sender:
+            try:
+                await sender.send_str(json.dumps({"type": "busy"}))
+            except Exception:
+                pass
+        return
+    _pending.clear()
+    try:
+        await _broadcast({"type": "processing", "value": True})
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _do_turn, text)
+    finally:
+        _lock.release()
+        if _pending:
+            _history.append({
+                "type": "ai_turn",
+                "text": "".join(_pending),
+                "ts":   time.time(),
+            })
+        _pending.clear()
+        await _broadcast({"type": "processing", "value": False})
+        _send_stats()
 
-# ── WebSocket handler ─────────────────────────────────────────────────────────
+# ── WebSocket handler ────────────────────────────────────────────────────────────
 async def _ws_handler(request):
     from aiohttp import web, WSMsgType
     ws = web.WebSocketResponse(heartbeat=30)
     await ws.prepare(request)
     _ws_clients.add(ws)
+
+    if _history:
+        await ws.send_str(json.dumps({"type": "history", "events": _history}))
     _send_stats()
+
     try:
         async for raw in ws:
             if raw.type != WSMsgType.TEXT:
@@ -142,71 +157,53 @@ async def _ws_handler(request):
                 text = (msg.get("text") or "").strip()
                 if not text:
                     continue
-                if _processing_lock.locked():
-                    await ws.send_str(json.dumps({"type": "busy"}))
-                    continue
+                ev = {"type": "user", "text": text, "ts": time.time()}
+                _history.append(ev)
                 loop = asyncio.get_event_loop()
-                loop.create_task(_handle_input(text))
+                # Broadcast user event to other clients only (sender shows it locally)
+                loop.create_task(_broadcast(ev, skip=ws))
+                loop.create_task(_handle_input(text, sender=ws))
             elif t == "confirm_response":
-                _confirm_result[0] = bool(msg.get("approved"))
-                _confirm_event.set()
+                _confirm_ok[0] = bool(msg.get("approved"))
+                _confirm_ev.set()
     finally:
         _ws_clients.discard(ws)
     return ws
 
-
-async def _handle_input(text: str):
-    if not _processing_lock.acquire(blocking=False):
-        return
-    try:
-        _broadcast_sync({"type": "processing", "value": True})
-        await asyncio.get_event_loop().run_in_executor(None, _do_turn, text)
-    finally:
-        _processing_lock.release()
-        _broadcast_sync({"type": "processing", "value": False})
-        _send_stats()
-
-
-# ── HTTP ──────────────────────────────────────────────────────────────────────
+# ── HTTP ─────────────────────────────────────────────────────────────────────────
 async def _index(request):
     from aiohttp import web
     return web.Response(text=_HTML, content_type='text/html', charset='utf-8')
 
-
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── Entry point ──────────────────────────────────────────────────────────────────
 def run(state: dict, host: str = '0.0.0.0', port: int = 8080):
-    """Avvia il server web. Blocca finché il processo non esce."""
     global _main_loop, _state
     try:
         from aiohttp import web
     except ImportError:
-        sys.stderr.write("ERROR: aiohttp mancante. Esegui: pip install aiohttp\n")
+        sys.stderr.write("ERROR: pip install aiohttp\n")
         sys.exit(1)
 
     _state = state
 
     import loki as _l
-    _l._web_confirm_fn = confirm_web   # hook per confirm_command
+    _l._web_confirm_fn = confirm_web
 
-    app = web.Application()
-    app.router.add_get('/',   _index)
-    app.router.add_get('/ws', _ws_handler)
-
-    orig_stdout = sys.stdout
-    sys.stdout  = WebOutputProxy(orig_stdout)
+    orig = sys.stdout
+    sys.stdout = WebOutputProxy(orig)
 
     async def _serve():
         global _main_loop
         _main_loop = asyncio.get_event_loop()
+        app = web.Application()
+        app.router.add_get('/',   _index)
+        app.router.add_get('/ws', _ws_handler)
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, host, port)
         await site.start()
-        orig_stdout.write(
-            f"\n  ◈ Loki Web UI  →  http://localhost:{port}\n"
-            f"  Tailscale:        http://<tailscale-ip>:{port}\n\n"
-        )
-        orig_stdout.flush()
+        orig.write(f"\n  ◈ Loki Web  →  http://localhost:{port}\n\n")
+        orig.flush()
         await asyncio.Event().wait()
 
     try:
@@ -214,206 +211,226 @@ def run(state: dict, host: str = '0.0.0.0', port: int = 8080):
     except KeyboardInterrupt:
         pass
     finally:
-        sys.stdout = orig_stdout
+        sys.stdout = orig
         _l._web_confirm_fn = None
 
 
-# ── HTML ──────────────────────────────────────────────────────────────────────
+# ── HTML ──────────────────────────────────────────────────────────────────────────
 _HTML = r"""<!DOCTYPE html>
 <html lang="it">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0b0505">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
 <title>Loki</title>
 <style>
-:root {
-  --bg:        #0b0505;
-  --bg2:       #140808;
-  --bg3:       #1c0c0c;
-  --accent:    #7d1020;
-  --accent2:   #b01828;
-  --text:      #e2d6d6;
-  --text2:     #8a6e6e;
-  --border:    #2a1010;
-  --tool-bg:   #0e0606;
-  --think-fg:  #6e4a4a;
-  --red:       #c41020;
-  --green:     #5a8040;
-  --mono: 'JetBrains Mono','Fira Mono','Cascadia Code',monospace;
+/* ── Reset ── */
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{-webkit-text-size-adjust:100%}
+
+/* ── Tokens ── */
+:root{
+  --bg:      #0b0505;
+  --bg2:     #120606;
+  --bg3:     #1b0b0b;
+  --bg4:     #231010;
+  --accent:  #7d1020;
+  --accent2: #b01828;
+  --text:    #e0d4d4;
+  --text2:   #8a6e6e;
+  --dim:     #4a3030;
+  --border:  #281010;
+  --tool-bg: #0d0505;
+  --green:   #4d7a3a;
+  --red:     #b02020;
+  --yellow:  #8a5c1a;
+  --mono:    'JetBrains Mono','Cascadia Code','Fira Mono',ui-monospace,monospace;
+  --r:       5px;
 }
-*{box-sizing:border-box;margin:0;padding:0}
-html,body{height:100%;overflow:hidden}
-body{
-  background:var(--bg);color:var(--text);
-  font-family:var(--mono);font-size:14px;
-  display:flex;flex-direction:column;
-}
+
+/* ── Layout ── */
+html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);font-family:var(--mono);font-size:14px;line-height:1.5}
+#app{display:flex;flex-direction:column;height:100dvh}
 
 /* ── Header ── */
 #hdr{
   background:var(--bg2);border-bottom:1px solid var(--border);
-  padding:9px 20px;display:flex;align-items:center;gap:12px;flex-shrink:0;
+  padding:0 16px;height:46px;
+  display:flex;align-items:center;gap:10px;flex-shrink:0;
 }
-.logo{color:var(--accent2);font-weight:700;font-size:17px;letter-spacing:3px}
-.dot{width:8px;height:8px;border-radius:50%;background:var(--green);display:inline-block;transition:background .3s}
-.dot.off{background:var(--red)}
-#status{color:var(--text2);font-size:12px}
-.spacer{flex:1}
-#busy-label{color:var(--accent2);font-size:12px;display:none}
-#busy-label.on{display:block}
+.logo{color:var(--accent2);font-weight:700;font-size:15px;letter-spacing:4px;flex-shrink:0}
+#conn-dot{width:7px;height:7px;border-radius:50%;background:var(--red);flex-shrink:0;transition:background .3s}
+#conn-dot.ok{background:var(--green)}
+#conn-txt{color:var(--text2);font-size:11px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#busy{display:flex;align-items:center;gap:6px;visibility:hidden}
+#busy.on{visibility:visible}
+.spin{width:10px;height:10px;border-radius:50%;border:2px solid var(--border);border-top-color:var(--accent2);animation:spin .7s linear infinite;flex-shrink:0}
+@keyframes spin{to{transform:rotate(360deg)}}
+#busy-txt{color:var(--accent2);font-size:11px}
 
 /* ── Messages ── */
 #msgs{
-  flex:1;overflow-y:auto;padding:14px 20px;
-  display:flex;flex-direction:column;gap:10px;
+  flex:1;overflow-y:auto;
+  padding:16px 16px 8px;
+  display:flex;flex-direction:column;gap:16px;
 }
 #msgs::-webkit-scrollbar{width:3px}
-#msgs::-webkit-scrollbar-track{background:var(--bg)}
+#msgs::-webkit-scrollbar-track{background:transparent}
 #msgs::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
 
-.msg{display:flex;flex-direction:column;gap:3px;max-width:96%}
+/* User bubble */
+.m-user{display:flex;flex-direction:column;align-items:flex-end;align-self:flex-end;max-width:min(82%,640px)}
+.m-user .role{color:var(--text2);font-size:10px;margin-bottom:3px;padding-right:2px}
+.m-user .bubble{
+  background:var(--bg3);border:1px solid var(--accent);
+  border-radius:var(--r) var(--r) 2px var(--r);
+  padding:10px 14px;white-space:pre-wrap;word-break:break-word;font-size:13px;line-height:1.6;
+}
 
-/* User */
-.msg-user{
-  background:var(--bg2);border-left:3px solid var(--accent);
-  padding:9px 14px;border-radius:0 4px 4px 0;align-self:flex-start;
-}
-.role-user{color:var(--accent2);font-size:11px;margin-bottom:3px}
+/* AI bubble */
+.m-ai{display:flex;flex-direction:column;align-self:flex-start;max-width:min(96%,820px);width:100%}
+.m-ai .role{color:var(--dim);font-size:10px;margin-bottom:4px;padding-left:1px}
+.m-ai .body{white-space:pre-wrap;word-break:break-word;font-size:13px;line-height:1.75;color:var(--text)}
 
-/* Assistant */
-.msg-ai{align-self:flex-start}
-.role-ai{color:var(--text2);font-size:11px;margin-bottom:3px}
-.ai-content{white-space:pre-wrap;line-height:1.65;word-break:break-word}
-
-/* Thinking */
-.think-wrap{
-  background:var(--bg2);border-left:2px solid var(--border);
-  padding:5px 12px;border-radius:0 3px 3px 0;margin-bottom:5px;
-}
-.think-toggle{
-  color:var(--think-fg);font-size:11px;cursor:pointer;user-select:none;
-  display:flex;align-items:center;gap:6px;
-}
-.think-toggle:hover{color:var(--text2)}
-.think-body{
-  color:var(--think-fg);font-size:12px;margin-top:5px;
-  white-space:pre-wrap;line-height:1.5;max-height:300px;
-  overflow-y:auto;display:none;
-}
-.think-body.open{display:block}
-
-/* Tool */
-.tool-call{
-  background:var(--tool-bg);border:1px solid var(--border);
-  border-radius:4px;padding:7px 12px;margin:3px 0;
-}
-.tc-header{color:var(--text2);font-size:11px;margin-bottom:3px}
-.tc-cmd{color:var(--accent2);white-space:pre-wrap;word-break:break-all;font-size:13px}
-.tool-out{
-  background:var(--tool-bg);border:1px solid var(--border);
-  border-radius:4px;padding:7px 12px;margin:2px 0 4px;
-  max-height:180px;overflow-y:auto;white-space:pre-wrap;
-  font-size:12px;color:var(--text2);word-break:break-all;
-}
+/* Line-level colouring (AI output) */
+.lt{color:var(--accent2)}   /* tool call  ⏺ ◆ */
+.lo{color:var(--green)}     /* ok         ✓ ✔  */
+.le{color:var(--red)}       /* error      ✗ ✘  */
+.lw{color:var(--yellow)}    /* warn       ⚠    */
+.ld{color:var(--text2)}     /* dim        │ ╭  */
 
 /* Streaming cursor */
-.cursor{
-  display:inline-block;width:7px;height:13px;
-  background:var(--accent2);animation:blink .75s step-end infinite;
-  vertical-align:text-bottom;margin-left:1px;
-}
+.cur{display:inline-block;width:6px;height:13px;background:var(--accent2);vertical-align:text-bottom;margin-left:1px;animation:blink .8s step-end infinite}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
 
 /* System note */
-.sys-note{color:var(--text2);font-size:12px;padding:2px 0;font-style:italic}
+.m-sys{align-self:center;color:var(--dim);font-size:11px;padding:3px 12px;border-radius:12px;background:var(--bg2);border:1px solid var(--border);font-style:italic;text-align:center}
 
 /* ── Status bar ── */
 #sb{
   background:var(--bg2);border-top:1px solid var(--border);
-  padding:4px 20px;font-size:11px;color:var(--text2);
-  display:flex;gap:16px;flex-shrink:0;
+  height:26px;padding:0 16px;
+  display:flex;align-items:center;gap:0;
+  font-size:10px;color:var(--text2);flex-shrink:0;overflow:hidden;
 }
+.si{padding:0 10px;border-right:1px solid var(--border);white-space:nowrap;line-height:26px;height:100%}
+.si:first-child{padding-left:0}
+.si:last-child{border-right:none}
+#ctx-bar{height:2px;background:var(--accent);border-radius:1px;transition:width .5s ease;align-self:center}
 
-/* ── Input ── */
+/* ── Input bar ── */
 #ibar{
   background:var(--bg2);border-top:1px solid var(--border);
-  padding:10px 16px;display:flex;gap:10px;align-items:flex-end;flex-shrink:0;
+  padding:10px 12px;display:flex;align-items:flex-end;gap:8px;flex-shrink:0;
+  padding-bottom:max(10px,env(safe-area-inset-bottom));
 }
 #inp{
   flex:1;background:var(--bg3);border:1px solid var(--border);
-  border-radius:4px;color:var(--text);font-family:var(--mono);font-size:14px;
-  padding:9px 13px;resize:none;min-height:40px;max-height:150px;
-  outline:none;line-height:1.4;
+  border-radius:var(--r);color:var(--text);font-family:var(--mono);font-size:14px;
+  padding:10px 12px;resize:none;min-height:42px;max-height:160px;
+  outline:none;line-height:1.5;transition:border-color .15s;
 }
 #inp:focus{border-color:var(--accent)}
-#inp::placeholder{color:var(--text2)}
+#inp::placeholder{color:var(--dim)}
 #sbtn{
-  background:var(--accent);color:var(--text);border:none;
-  border-radius:4px;padding:9px 16px;font-family:var(--mono);font-size:14px;
-  cursor:pointer;transition:background .15s;white-space:nowrap;flex-shrink:0;
+  flex-shrink:0;background:var(--accent);color:var(--text);
+  border:none;border-radius:var(--r);
+  min-width:46px;height:42px;
+  font-family:var(--mono);font-size:18px;cursor:pointer;
+  transition:background .15s,opacity .15s;
+  display:flex;align-items:center;justify-content:center;
 }
-#sbtn:hover{background:var(--accent2)}
+#sbtn:hover:not(:disabled){background:var(--accent2)}
 #sbtn:disabled{opacity:.35;cursor:default}
+
+/* ── Scroll-to-bottom button ── */
+#scrollbtn{
+  position:fixed;right:16px;bottom:80px;
+  background:var(--bg4);border:1px solid var(--border);
+  color:var(--text2);border-radius:50%;width:34px;height:34px;
+  display:flex;align-items:center;justify-content:center;
+  cursor:pointer;font-size:14px;opacity:0;pointer-events:none;
+  transition:opacity .2s;z-index:50;
+}
+#scrollbtn.on{opacity:1;pointer-events:auto}
+#scrollbtn:hover{background:var(--bg3);color:var(--text)}
 
 /* ── Confirm modal ── */
 #overlay{
-  display:none;position:fixed;inset:0;
-  background:rgba(0,0,0,.72);z-index:100;
-  align-items:center;justify-content:center;
+  display:none;position:fixed;inset:0;background:rgba(0,0,0,.82);
+  z-index:100;align-items:center;justify-content:center;padding:16px;
 }
 #overlay.on{display:flex}
 #modal{
   background:var(--bg2);border:1px solid var(--accent);
-  border-radius:6px;padding:22px 26px;max-width:560px;width:92%;
+  border-radius:var(--r);padding:22px;width:100%;max-width:520px;
 }
-#modal h3{color:var(--accent2);margin-bottom:11px;font-size:13px}
+#modal-hdr{display:flex;align-items:center;gap:8px;margin-bottom:14px}
+.mpulse{width:8px;height:8px;border-radius:50%;background:var(--accent2);animation:pulse 1.4s ease-in-out infinite;flex-shrink:0}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+#modal-hdr span{color:var(--accent2);font-size:12px}
 .cmd-box{
-  background:var(--tool-bg);border:1px solid var(--border);
-  border-radius:4px;padding:9px 13px;font-size:13px;
-  color:var(--accent2);white-space:pre-wrap;word-break:break-all;
-  margin-bottom:16px;max-height:190px;overflow-y:auto;
+  background:var(--tool-bg);border:1px solid var(--border);border-radius:4px;
+  padding:10px 13px;font-size:13px;color:var(--accent2);
+  white-space:pre-wrap;word-break:break-all;max-height:200px;overflow-y:auto;
+  margin-bottom:18px;line-height:1.5;
 }
-.mbtn-row{display:flex;gap:10px;justify-content:flex-end}
+.mbtns{display:flex;gap:10px;justify-content:flex-end}
 .mbtn{
-  padding:8px 18px;border-radius:4px;border:none;
-  font-family:var(--mono);font-size:13px;cursor:pointer;
+  padding:9px 22px;border-radius:4px;border:none;
+  font-family:var(--mono);font-size:13px;cursor:pointer;min-height:40px;
 }
 #byes{background:var(--accent);color:var(--text)}
 #byes:hover{background:var(--accent2)}
 #bno{background:var(--bg3);color:var(--text2);border:1px solid var(--border)}
 #bno:hover{color:var(--text)}
+
+/* ── Mobile tweaks ── */
+@media(max-width:480px){
+  .m-user,.m-ai{max-width:100%}
+  .mbtn{flex:1;padding:12px}
+  #sb .si:nth-child(n+4){display:none}
+}
 </style>
 </head>
 <body>
+<div id="app">
 
-<div id="hdr">
-  <span class="logo">◈ LOKI</span>
-  <span class="dot off" id="dot"></span>
-  <span id="status">connessione...</span>
-  <span class="spacer"></span>
-  <span id="busy-label">⏺ elaborando...</span>
+  <div id="hdr">
+    <span class="logo">◈ LOKI</span>
+    <span id="conn-dot"></span>
+    <span id="conn-txt">connessione...</span>
+    <div id="busy"><div class="spin"></div><span id="busy-txt">elaborando</span></div>
+  </div>
+
+  <div id="msgs"></div>
+
+  <div id="sb">
+    <div class="si" id="sb-model">—</div>
+    <div class="si" id="sb-msgs">0 msg</div>
+    <div class="si" id="sb-ctx">ctx —</div>
+    <div id="ctx-bar" style="width:0;margin:0 8px"></div>
+    <div class="si" id="sb-up">0s</div>
+  </div>
+
+  <div id="ibar">
+    <textarea id="inp" rows="1"
+      placeholder="Messaggio… (Enter invia · Shift+Enter a capo · /help)"></textarea>
+    <button id="sbtn" title="Invia (Enter)">↑</button>
+  </div>
+
 </div>
 
-<div id="msgs"></div>
-
-<div id="sb">
-  <span id="sb-model">—</span>
-  <span id="sb-msgs">0 msg</span>
-  <span id="sb-ctx"></span>
-  <span id="sb-up"></span>
-</div>
-
-<div id="ibar">
-  <textarea id="inp" rows="1"
-    placeholder="Messaggio... (Enter invia · Shift+Enter a capo · /help per comandi)"></textarea>
-  <button id="sbtn">Invia</button>
-</div>
+<div id="scrollbtn" title="Scorri in basso">↓</div>
 
 <div id="overlay">
   <div id="modal">
-    <h3>⏺ Conferma esecuzione comando</h3>
+    <div id="modal-hdr"><div class="mpulse"></div><span>Conferma esecuzione comando</span></div>
     <div class="cmd-box" id="modal-cmd"></div>
-    <div class="mbtn-row">
+    <div class="mbtns">
       <button class="mbtn" id="bno">✕ No</button>
       <button class="mbtn" id="byes">✓ Esegui</button>
     </div>
@@ -421,188 +438,231 @@ body{
 </div>
 
 <script>
-const $ = id => document.getElementById(id);
-const msgs    = $('msgs');
-const inp     = $('inp');
-const sbtn    = $('sbtn');
-const dot     = $('dot');
-const statusEl= $('status');
-const overlay = $('overlay');
-const busyLbl = $('busy-label');
+const $ = id => document.getElementById(id)
+const esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+const msgs = $('msgs'), inp = $('inp'), sbtn = $('sbtn'), overlay = $('overlay')
 
-let ws, reconnTimer;
-let processing = false;
-
-// ── WebSocket ────────────────────────────────────────────────────────────────
-function connect() {
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}/ws`);
-  ws.onopen = () => {
-    dot.className = 'dot';
-    statusEl.textContent = 'connesso';
-    clearTimeout(reconnTimer);
-  };
-  ws.onclose = () => {
-    dot.className = 'dot off';
-    statusEl.textContent = 'disconnesso — riconnetto...';
-    reconnTimer = setTimeout(connect, 2000);
-  };
-  ws.onerror = () => ws.close();
-  ws.onmessage = e => handle(JSON.parse(e.data));
+/* ── Line classifier ── */
+function paintLine(line) {
+  const e = esc(line)
+  if (/^\s*[⏺◆▸►]/.test(line))                    return `<span class="lt">${e}</span>`
+  if (/^\s*[✓✔]/.test(line))                         return `<span class="lo">${e}</span>`
+  if (/^\s*[✗✘✕]/.test(line))                        return `<span class="le">${e}</span>`
+  if (/^\s*⚠/.test(line))                             return `<span class="lw">${e}</span>`
+  if (/^\s{3,}[│╭╰├─╴]/.test(line))                  return `<span class="ld">${e}</span>`
+  return e
+}
+function renderText(text) {
+  return text.split('\n').map(paintLine).join('\n')
 }
 
-function send(data) {
-  if (ws && ws.readyState === 1) ws.send(JSON.stringify(data));
-}
-
-// ── Current streaming AI message ─────────────────────────────────────────────
-let _aiDiv = null;        // current .msg-ai
-let _contentEl = null;    // .ai-content inside _aiDiv
-let _cursorEl = null;
-let _buf = '';            // accumulated streamed text
-
-function resetStream() {
-  _aiDiv = null; _contentEl = null; _cursorEl = null; _buf = '';
-}
-
-function ensureAiDiv() {
-  if (_aiDiv) return;
-  _aiDiv = document.createElement('div');
-  _aiDiv.className = 'msg msg-ai';
-  const role = document.createElement('div');
-  role.className = 'role-ai';
-  role.textContent = '● loki';
-  _aiDiv.appendChild(role);
-  _contentEl = document.createElement('div');
-  _contentEl.className = 'ai-content';
-  _aiDiv.appendChild(_contentEl);
-  msgs.appendChild(_aiDiv);
-}
-
-function appendStream(text) {
-  ensureAiDiv();
-  _buf += text;
-  if (_cursorEl) _cursorEl.remove();
-  _contentEl.textContent = _buf;
-  if (!_cursorEl) {
-    _cursorEl = document.createElement('span');
-    _cursorEl.className = 'cursor';
+/* ── Scroll management ── */
+let pinned = true
+msgs.addEventListener('scroll', () => {
+  pinned = msgs.scrollTop + msgs.clientHeight >= msgs.scrollHeight - 80
+  $('scrollbtn').className = pinned ? '' : 'on'
+})
+function scrollBot(force=false) {
+  if (pinned || force) {
+    msgs.scrollTop = msgs.scrollHeight
+    pinned = true
+    $('scrollbtn').className = ''
   }
-  _contentEl.appendChild(_cursorEl);
-  scrollBottom();
+}
+$('scrollbtn').onclick = () => { msgs.scrollTop = msgs.scrollHeight; pinned = true; $('scrollbtn').className = '' }
+
+/* ── Message builders ── */
+function mkUser(text) {
+  const d = document.createElement('div')
+  d.className = 'm-user'
+  d.innerHTML = `<div class="role">❯ tu</div><div class="bubble">${esc(text)}</div>`
+  msgs.appendChild(d)
+  scrollBot(true)
+}
+function mkSys(text) {
+  const d = document.createElement('div')
+  d.className = 'm-sys'
+  d.textContent = text
+  msgs.appendChild(d)
+  scrollBot()
 }
 
-function endStream() {
-  if (_cursorEl) { _cursorEl.remove(); _cursorEl = null; }
-  resetStream();
+/* ── AI streaming ── */
+let _aDiv=null, _aBody=null, _aCur=null, _aBuf=''
+
+function ensureAi() {
+  if (_aDiv) return
+  _aDiv = document.createElement('div')
+  _aDiv.className = 'm-ai'
+  _aBody = document.createElement('div')
+  _aBody.className = 'body'
+  const role = document.createElement('div')
+  role.className = 'role'
+  role.textContent = '● loki'
+  _aDiv.appendChild(role)
+  _aDiv.appendChild(_aBody)
+  msgs.appendChild(_aDiv)
+}
+function appendChunk(text) {
+  ensureAi()
+  _aBuf += text
+  if (_aCur) _aCur.remove()
+  _aBody.innerHTML = renderText(_aBuf)
+  if (!_aCur) { _aCur = document.createElement('span'); _aCur.className = 'cur' }
+  _aBody.appendChild(_aCur)
+  scrollBot()
+}
+function endAi() {
+  if (_aCur) { _aCur.remove(); _aCur=null }
+  _aDiv=null; _aBody=null; _aBuf=''
 }
 
-// ── Message types ─────────────────────────────────────────────────────────────
+/* ── History replay ── */
+function replay(events) {
+  msgs.innerHTML = ''
+  endAi()
+  for (const ev of events) {
+    if (ev.type === 'user') {
+      mkUser(ev.text)
+    } else if (ev.type === 'ai_turn') {
+      const d = document.createElement('div')
+      d.className = 'm-ai'
+      d.innerHTML = `<div class="role">● loki</div><div class="body">${renderText(ev.text)}</div>`
+      msgs.appendChild(d)
+    } else if (ev.type === 'sys') {
+      mkSys(ev.text)
+    }
+  }
+  scrollBot(true)
+}
+
+/* ── Stats & uptime ── */
+let _upSec=0, _upTimer=null
+function startUptime(base) {
+  _upSec = base
+  clearInterval(_upTimer)
+  _upTimer = setInterval(() => {
+    _upSec++
+    const m=Math.floor(_upSec/60), s=_upSec%60
+    $('sb-up').textContent = m ? `${m}m ${s}s` : `${s}s`
+  }, 1000)
+}
+function applyStats(m) {
+  $('sb-model').textContent = m.model || '—'
+  $('sb-msgs').textContent  = (m.msgs||0)+' msg'
+  const p = m.ctx_pct || 0
+  $('sb-ctx').textContent   = `ctx ${p}%`
+  $('ctx-bar').style.width  = Math.min(p,100)*0.6+'px'
+  if (m.uptime !== undefined) startUptime(m.uptime)
+}
+
+/* ── WS message handler ── */
+let processing = false
+
 function handle(msg) {
   switch (msg.type) {
+    case 'history':
+      replay(msg.events || [])
+      break
+    case 'user':
+      // Another device sent a message — show it here too
+      mkUser(msg.text)
+      break
     case 'out':
-      appendStream(msg.text);
-      break;
-
+      appendChunk(msg.text)
+      break
     case 'processing':
-      processing = msg.value;
-      sbtn.disabled = processing;
-      sbtn.textContent = processing ? '...' : 'Invia';
-      busyLbl.className = processing ? 'on' : '';
-      if (!processing) endStream();
-      break;
-
+      processing = msg.value
+      sbtn.disabled = processing
+      $('busy').className = processing ? 'on' : ''
+      if (!processing) endAi()
+      break
     case 'confirm':
-      showConfirm(msg.command);
-      break;
-
+      showConfirm(msg.command)
+      break
     case 'clear':
-      msgs.innerHTML = '';
-      resetStream();
-      appendSys('Conversazione cancellata.');
-      break;
-
+      msgs.innerHTML = ''
+      endAi()
+      mkSys('Conversazione cancellata.')
+      break
     case 'busy':
-      appendSys('⚠ Loki sta già elaborando — attendi.');
-      break;
-
+      mkSys('⚠ Loki sta già elaborando — attendi.')
+      break
     case 'server_exit':
-      appendSys('Loki si è spento.');
-      break;
-
+      mkSys('Loki si è spento.')
+      break
     case 'stats':
-      $('sb-model').textContent = msg.model || '—';
-      $('sb-msgs').textContent  = (msg.messages || 0) + ' msg';
-      $('sb-ctx').textContent   = msg.ctx_pct ? 'ctx ' + msg.ctx_pct + '%' : '';
-      if (msg.uptime !== undefined) {
-        const m = Math.floor(msg.uptime / 60), s = msg.uptime % 60;
-        $('sb-up').textContent = `${m}m ${s}s`;
-      }
-      break;
+      applyStats(msg)
+      break
   }
 }
 
-// ── User message ──────────────────────────────────────────────────────────────
-function addUser(text) {
-  const div = document.createElement('div');
-  div.className = 'msg msg-user';
-  const role = document.createElement('div');
-  role.className = 'role-user';
-  role.textContent = '❯ tu';
-  div.appendChild(role);
-  const c = document.createElement('div');
-  c.textContent = text;
-  div.appendChild(c);
-  msgs.appendChild(div);
+/* ── WebSocket ── */
+let ws=null, _reconn=null
+
+function connect() {
+  clearTimeout(_reconn)
+  const proto = location.protocol==='https:' ? 'wss' : 'ws'
+  ws = new WebSocket(`${proto}://${location.host}/ws`)
+
+  ws.onopen = () => {
+    $('conn-dot').className = 'ok'
+    $('conn-txt').textContent = 'connesso'
+  }
+  ws.onclose = () => {
+    $('conn-dot').className = ''
+    $('conn-txt').textContent = 'disconnesso — riconnetto...'
+    ws = null
+    _reconn = setTimeout(connect, 2000)
+  }
+  ws.onerror = () => ws && ws.close()
+  ws.onmessage = e => { try { handle(JSON.parse(e.data)) } catch(ex){ console.error(ex) } }
 }
 
-function appendSys(text) {
-  const d = document.createElement('div');
-  d.className = 'sys-note';
-  d.textContent = text;
-  msgs.appendChild(d);
-  scrollBottom();
+function wsSend(data) {
+  if (ws && ws.readyState===1) ws.send(JSON.stringify(data))
 }
 
-function scrollBottom() {
-  msgs.scrollTop = msgs.scrollHeight;
-}
-
-// ── Confirm modal ─────────────────────────────────────────────────────────────
+/* ── Confirm modal ── */
 function showConfirm(cmd) {
-  $('modal-cmd').textContent = cmd;
-  overlay.className = 'on';
-  $('byes').focus();
+  $('modal-cmd').textContent = cmd
+  overlay.className = 'on'
+  $('byes').focus()
 }
-function hideConfirm() { overlay.className = ''; }
+function hideConfirm() { overlay.className = '' }
 
-$('byes').onclick = () => { hideConfirm(); send({type:'confirm_response',approved:true}); };
-$('bno').onclick  = () => { hideConfirm(); send({type:'confirm_response',approved:false}); };
-overlay.addEventListener('click', e => { if (e.target === overlay) { hideConfirm(); send({type:'confirm_response',approved:false}); } });
-document.addEventListener('keydown', e => { if (e.key === 'Escape' && overlay.className === 'on') { hideConfirm(); send({type:'confirm_response',approved:false}); }});
+$('byes').onclick = () => { hideConfirm(); wsSend({type:'confirm_response',approved:true}) }
+$('bno').onclick  = () => { hideConfirm(); wsSend({type:'confirm_response',approved:false}) }
+overlay.addEventListener('click', e => {
+  if (e.target===overlay) { hideConfirm(); wsSend({type:'confirm_response',approved:false}) }
+})
+document.addEventListener('keydown', e => {
+  if (e.key==='Escape' && overlay.className==='on') {
+    hideConfirm(); wsSend({type:'confirm_response',approved:false})
+  }
+})
 
-// ── Input ─────────────────────────────────────────────────────────────────────
+/* ── Input ── */
 function submit() {
-  const text = inp.value.trim();
-  if (!text || processing) return;
-  inp.value = '';
-  inp.style.height = 'auto';
-  addUser(text);
-  scrollBottom();
-  send({type: 'input', text});
+  const text = inp.value.trim()
+  if (!text || processing) return
+  inp.value = ''
+  inp.style.height = 'auto'
+  mkUser(text)
+  wsSend({type:'input', text})
 }
 
 inp.addEventListener('keydown', e => {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); }
-});
+  if (e.key==='Enter' && !e.shiftKey) { e.preventDefault(); submit() }
+})
 inp.addEventListener('input', () => {
-  inp.style.height = 'auto';
-  inp.style.height = Math.min(inp.scrollHeight, 150) + 'px';
-});
-sbtn.onclick = submit;
+  inp.style.height = 'auto'
+  inp.style.height = Math.min(inp.scrollHeight,160)+'px'
+})
+sbtn.onclick = submit
 
-connect();
-inp.focus();
+connect()
+inp.focus()
 </script>
 </body>
 </html>"""

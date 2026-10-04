@@ -177,6 +177,7 @@ SLASH_COMMANDS = {
 
 _web_confirm_fn = None   # set by loki_web.run() when LOKI_UI=web
 _active_project: dict | None = None  # set by /project switch
+_current_chat_id: str | None = None  # set by loki_web when active chat changes
 
 stats = {
     'start_time':    datetime.now(),
@@ -2462,7 +2463,8 @@ def _run_turn(state):
                     if _active_project:
                         import loki_projects
                         _active_project = loki_projects.set_mem(
-                            _active_project['name'], args.get('key',''), args.get('value',''))
+                            _active_project['name'], args.get('key',''), args.get('value',''),
+                            chat_id=_current_chat_id)
                         output = f"✓ Memorizzato: {args.get('key')} = {args.get('value')}"
                     else:
                         output = "Nessun progetto attivo. Usa /project new <nome> per crearne uno."

@@ -1,5 +1,5 @@
 """Loki Projects — persistent per-project key-value memory."""
-import json, re
+import json, re, time
 from datetime import datetime
 from pathlib import Path
 
@@ -44,14 +44,17 @@ def save(project: dict):
 
 def create(name: str, description: str = '') -> dict:
     p = {'name': name, 'description': description,
-         'memory': {}, 'created_at': datetime.now().isoformat()}
+         'memory': {}, 'memory_meta': {}, 'created_at': datetime.now().isoformat()}
     save(p)
     return p
 
 
-def set_mem(name: str, key: str, value: str) -> dict:
+def set_mem(name: str, key: str, value: str, chat_id: str | None = None) -> dict:
     p = load(name) or create(name)
     p['memory'][key] = value
+    if 'memory_meta' not in p:
+        p['memory_meta'] = {}
+    p['memory_meta'][key] = {'chat_id': chat_id, 'set_at': time.time()}
     save(p)
     return p
 
@@ -61,6 +64,7 @@ def del_mem(name: str, key: str) -> bool:
     if not p or key not in p['memory']:
         return False
     del p['memory'][key]
+    p.get('memory_meta', {}).pop(key, None)
     save(p)
     return True
 

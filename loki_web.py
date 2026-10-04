@@ -17,6 +17,7 @@ _history: list    = []   # [{type,text|data,ts}, …]  — user + ai_turn + sys 
 _pending: list    = []   # accumulates AI output chunks during a turn
 _state: dict      = {}
 _lock             = threading.Lock()
+_current_chat: dict | None = None
 
 # ── Confirm bridge (sync executor → async WS) ───────────────────────────────────
 _confirm_ev = threading.Event()
@@ -85,6 +86,7 @@ def _project_payload():
             "active":      p['name'] if p else None,
             "description": p.get('description','') if p else '',
             "memory":      p.get('memory',{}) if p else {},
+            "memory_meta": p.get('memory_meta',{}) if p else {},
             "projects":    all_p,
         }
     except Exception:
@@ -92,6 +94,126 @@ def _project_payload():
 
 def _send_project_state():
     _broadcast_sync(_project_payload())
+
+# ── Chat helpers ─────────────────────────────────────────────────────────────
+def _send_chat_list():
+    import loki_chats
+    _broadcast_sync({"type": "chat_list", "chats": loki_chats.list_chats()})
+
+def _send_chat_state():
+    global _current_chat
+    if _current_chat:
+        _broadcast_sync({
+            "type":     "chat_state",
+            "chat_id":  _current_chat["id"],
+            "title":    _current_chat.get("title", "Chat"),
+            "project":  _current_chat.get("project"),
+        })
+
+def _save_current_chat():
+    global _current_chat
+    if _current_chat:
+        import loki_chats
+        loki_chats.save_messages(_current_chat["id"], _state.get("messages", []))
+
+def _new_chat():
+    global _current_chat
+    import loki as _l, loki_chats
+    _save_current_chat()
+    project = _l._active_project["name"] if _l._active_project else None
+    _current_chat = loki_chats.create(project=project)
+    _l._current_chat_id = _current_chat["id"]
+    # Reset in-memory messages to fresh system prompt only
+    _state["messages"] = [{"role": "system", "content": _l.build_system_prompt()}]
+    _history.clear()
+    _broadcast_sync({"type": "clear"})
+    _send_chat_state()
+    _send_chat_list()
+
+def _switch_chat(chat_id: str):
+    global _current_chat
+    import loki as _l, loki_chats
+    if _current_chat and _current_chat["id"] == chat_id:
+        return
+    _save_current_chat()
+    chat = loki_chats.load(chat_id)
+    if not chat:
+        return
+    _current_chat = chat
+    _l._current_chat_id = chat["id"]
+    # Restore project
+    if chat.get("project"):
+        import loki_projects
+        p = loki_projects.load(chat["project"])
+        if p:
+            _l._active_project = p
+        else:
+            _l._active_project = None
+    else:
+        _l._active_project = None
+    # Rebuild messages: fresh system prompt + stored messages
+    system_msg = {"role": "system", "content": _l.build_system_prompt()}
+    stored = chat.get("messages", [])
+    _state["messages"] = [system_msg] + stored
+    # Rebuild history for replay
+    _history.clear()
+    for m in stored:
+        role = m.get("role")
+        content = m.get("content", "")
+        if isinstance(content, list):
+            content = " ".join(b.get("text", "") for b in content if b.get("type") == "text")
+        if role == "user":
+            _history.append({"type": "user", "text": content, "ts": 0})
+        elif role == "assistant":
+            _history.append({"type": "ai_turn", "text": content, "ts": 0})
+    _broadcast_sync({"type": "history", "events": list(_history)})
+    _send_chat_state()
+    _send_chat_list()
+    _send_project_state()
+
+def _on_title_generated(chat_id: str, title: str):
+    global _current_chat
+    if _current_chat and _current_chat["id"] == chat_id:
+        _current_chat["title"] = title
+    _broadcast_sync({"type": "chat_title_update", "chat_id": chat_id, "title": title})
+    _send_chat_list()
+
+def _handle_chat_action(msg: dict):
+    global _current_chat
+    action  = msg.get("action", "")
+    chat_id = msg.get("chat_id", "")
+
+    if action == "new":
+        _new_chat()
+
+    elif action == "switch":
+        if chat_id:
+            _switch_chat(chat_id)
+
+    elif action == "delete":
+        import loki_chats
+        if chat_id:
+            loki_chats.delete(chat_id)
+            if _current_chat and _current_chat["id"] == chat_id:
+                # Switch to newest remaining or create new
+                remaining = loki_chats.list_chats()
+                if remaining:
+                    _switch_chat(remaining[0]["id"])
+                else:
+                    _new_chat()
+            else:
+                _send_chat_list()
+
+    elif action == "rename":
+        import loki_chats
+        title = (msg.get("title") or "").strip()
+        if chat_id and title:
+            loki_chats.update_title(chat_id, title)
+            if _current_chat and _current_chat["id"] == chat_id:
+                _current_chat["title"] = title
+            _send_chat_state()
+            _send_chat_list()
+
 
 def _handle_project_action(msg: dict):
     """Called from WS handler for project_action messages (sync, runs in executor)."""
@@ -127,7 +249,8 @@ def _handle_project_action(msg: dict):
 
     elif action == 'set_mem':
         if key and _l._active_project:
-            _l._active_project = loki_projects.set_mem(_l._active_project['name'], key, value)
+            chat_id = _current_chat['id'] if _current_chat else None
+        _l._active_project = loki_projects.set_mem(_l._active_project['name'], key, value, chat_id=chat_id)
             if _state.get('messages') and _state['messages'][0]['role'] == 'system':
                 _state['messages'][0]['content'] = _l.build_system_prompt()
 
@@ -203,12 +326,18 @@ async def _handle_input(text: str, sender=None):
     finally:
         _lock.release()
         if _pending:
-            _history.append({
-                "type": "ai_turn",
-                "text": "".join(_pending),
-                "ts":   time.time(),
-            })
+            ai_text = "".join(_pending)
+            _history.append({"type": "ai_turn", "text": ai_text, "ts": time.time()})
+            # Auto-title: if first exchange and title still default
+            if _current_chat and _current_chat.get("title") == "Nuova chat":
+                user_msgs = [e for e in _history if e.get("type") == "user"]
+                if len(user_msgs) == 1:
+                    import loki_chats
+                    loki_chats.gen_title_async(
+                        _current_chat["id"], user_msgs[0]["text"],
+                        callback=_on_title_generated)
         _pending.clear()
+        _save_current_chat()
         await _broadcast({"type": "processing", "value": False})
         _send_stats()
         _send_project_state()
@@ -224,6 +353,8 @@ async def _ws_handler(request):
         await ws.send_str(json.dumps({"type": "history", "events": _history}))
     _send_stats()
     _send_project_state()
+    _send_chat_list()
+    _send_chat_state()
 
     try:
         async for raw in ws:
@@ -247,6 +378,9 @@ async def _ws_handler(request):
             elif t == "project_action":
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(None, _handle_project_action, msg)
+            elif t == "chat_action":
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, _handle_chat_action, msg)
             elif t == "confirm_response":
                 _confirm_ok[0] = bool(msg.get("approved"))
                 _confirm_ev.set()
@@ -269,9 +403,43 @@ def run(state: dict, host: str = '0.0.0.0', port: int = 8080):
         sys.exit(1)
 
     _state = state
+    global _current_chat
 
     import loki as _l
     _l._web_confirm_fn = confirm_web
+    # Start with first existing chat or create a new one
+    import loki_chats as _lc
+    existing = _lc.list_chats()
+    if existing:
+        chat = _lc.load(existing[0]["id"])
+        if chat:
+            _current_chat = chat
+            _l._current_chat_id = chat["id"]
+            # Restore project if chat had one
+            if chat.get("project"):
+                import loki_projects as _lp
+                p = _lp.load(chat["project"])
+                if p:
+                    _l._active_project = p
+            # Restore messages
+            system_msg = {"role": "system", "content": _l.build_system_prompt()}
+            stored = chat.get("messages", [])
+            _state["messages"] = [system_msg] + stored
+            for m in stored:
+                role = m.get("role")
+                content = m.get("content", "")
+                if isinstance(content, list):
+                    content = " ".join(b.get("text","") for b in content if b.get("type")=="text")
+                if role == "user":
+                    _history.append({"type": "user", "text": content, "ts": 0})
+                elif role == "assistant":
+                    _history.append({"type": "ai_turn", "text": content, "ts": 0})
+        else:
+            _current_chat = _lc.create()
+            _l._current_chat_id = _current_chat["id"]
+    else:
+        _current_chat = _lc.create()
+        _l._current_chat_id = _current_chat["id"]
 
     orig = sys.stdout
     sys.stdout = WebOutputProxy(orig)
@@ -338,6 +506,77 @@ html{-webkit-text-size-adjust:100%}
 /* ── Layout ── */
 html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);font-family:var(--mono);font-size:14px;line-height:1.5}
 #app{display:flex;flex-direction:column;height:100dvh}
+#mid{display:flex;flex:1;overflow:hidden;position:relative}
+#chat-area{flex:1;display:flex;flex-direction:column;overflow:hidden;min-width:0}
+
+/* ── Sidebar ── */
+#sidebar{
+  width:240px;flex-shrink:0;
+  background:var(--bg2);border-right:1px solid var(--border);
+  display:flex;flex-direction:column;overflow:hidden;
+  transition:width .2s ease;
+}
+#sidebar.collapsed{width:0}
+#sb-top{padding:8px;border-bottom:1px solid var(--border);flex-shrink:0}
+#new-chat-btn{
+  width:100%;background:var(--bg3);border:1px solid var(--border);
+  border-radius:4px;color:var(--text2);font-family:var(--mono);font-size:12px;
+  padding:8px;cursor:pointer;white-space:nowrap;overflow:hidden;
+}
+#new-chat-btn:hover{border-color:var(--accent);color:var(--text)}
+#chat-list{flex:1;overflow-y:auto;padding:4px}
+#chat-list::-webkit-scrollbar{width:2px}
+#chat-list::-webkit-scrollbar-thumb{background:var(--border)}
+.chat-group-label{
+  color:var(--dim);font-size:9px;letter-spacing:1px;text-transform:uppercase;
+  padding:8px 8px 3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.chat-row{
+  padding:7px 8px;border-radius:4px;cursor:pointer;
+  display:flex;align-items:flex-start;gap:4px;
+  border:1px solid transparent;margin-bottom:1px;
+}
+.chat-row:hover{background:var(--bg3)}
+.chat-row.active{background:var(--bg4);border-color:var(--accent)}
+.chat-row-body{flex:1;min-width:0;overflow:hidden}
+.chat-row-title{
+  color:var(--text);font-size:12px;font-weight:600;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.chat-row.active .chat-row-title{color:var(--accent2)}
+.chat-row-meta{color:var(--dim);font-size:10px;margin-top:1px}
+.chat-row-proj{
+  display:inline-block;color:var(--accent2);font-size:9px;
+  background:var(--bg);border:1px solid var(--accent);border-radius:2px;
+  padding:0 4px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%;
+}
+.chat-del{
+  background:none;border:none;color:var(--dim);cursor:pointer;
+  font-size:11px;padding:0 2px;flex-shrink:0;opacity:0;
+  transition:opacity .15s;align-self:center;
+}
+.chat-row:hover .chat-del{opacity:1}
+.chat-del:hover{color:var(--red)}
+.chat-title-input{
+  background:var(--bg3);border:1px solid var(--accent);border-radius:3px;
+  color:var(--text);font-family:var(--mono);font-size:12px;
+  padding:2px 6px;width:100%;outline:none;
+}
+#sidebar-btn{
+  background:none;border:none;color:var(--text2);font-size:16px;
+  cursor:pointer;padding:4px 6px;border-radius:4px;flex-shrink:0;
+}
+#sidebar-btn:hover{color:var(--text);background:var(--bg3)}
+/* pp chats section */
+.pp-chat-row{
+  padding:5px 8px;border-radius:3px;cursor:pointer;font-size:11px;
+  color:var(--text2);display:flex;align-items:center;gap:6px;
+  margin-bottom:2px;border:1px solid transparent;
+}
+.pp-chat-row:hover{background:var(--bg3);border-color:var(--border)}
+.pp-chat-row.active-chat{color:var(--accent2)}
+.mem-chat{color:var(--dim);font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100px}
+
 
 /* ── Header ── */
 #hdr{
@@ -571,6 +810,8 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
 
 /* ── Mobile tweaks ── */
 @media(max-width:480px){
+  #sidebar{display:none}
+  #sidebar.open{display:flex;position:absolute;left:0;top:46px;bottom:0;z-index:80;width:240px}
   .m-user,.m-ai{max-width:100%}
   .mbtn{flex:1;padding:12px}
   #sb .si:nth-child(n+4){display:none}
@@ -581,6 +822,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
 <div id="app">
 
   <div id="hdr">
+    <button id="sidebar-btn" title="Chat" onclick="toggleSidebar()">☰</button>
     <div class="logo"><div id="logo-svg-wrap" style="width:26px;height:26px"></div><span class="logo-txt">LOKI</span></div>
     <span id="conn-dot"></span>
     <span id="conn-txt">connessione...</span>
@@ -591,6 +833,16 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
     </button>
   </div>
 
+  <div id="mid">
+
+  <div id="sidebar">
+    <div id="sb-top">
+      <button id="new-chat-btn" onclick="wsSend({type:'chat_action',action:'new'})">+ Nuova chat</button>
+    </div>
+    <div id="chat-list"></div>
+  </div>
+
+  <div id="chat-area">
   <div id="msgs"></div>
 
   <div id="sb">
@@ -608,6 +860,8 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
   </div>
 
 </div>
+</div><!-- /chat-area -->
+</div><!-- /mid -->
 
 <div id="scrollbtn" title="Scorri in basso">↓</div>
 
@@ -636,6 +890,11 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
             <input id="pp-val" class="pp-input" placeholder="valore" autocomplete="off">
             <button id="pp-add-btn" onclick="addMem()">+ Salva</button>
           </div>
+        </div>
+        <!-- Linked chats -->
+        <div id="pp-chats-section" style="display:none;margin-top:10px">
+          <div class="pp-section-title">Chat collegate</div>
+          <div id="pp-chat-list"></div>
         </div>
         <!-- Close project -->
         <button id="pp-close-proj" onclick="wsSend({type:'project_action',action:'close'})"
@@ -740,6 +999,114 @@ function paintLine(line) {
 }
 function renderText(text) {
   return text.split('\n').map(paintLine).join('\n')
+}
+
+/* ── Chat sidebar ── */
+let _chats = [], _activeChatId = null
+
+function toggleSidebar() {
+  const sb = $('sidebar')
+  const collapsed = sb.classList.toggle('collapsed')
+  if (!collapsed) sb.classList.remove('open') // reset mobile class
+  // mobile: use 'open' class instead
+  if (window.innerWidth <= 640) {
+    sb.classList.remove('collapsed')
+    sb.classList.toggle('open')
+  }
+}
+
+function renderSidebar() {
+  const list = $('chat-list')
+  list.innerHTML = ''
+  if (!_chats.length) {
+    list.innerHTML = '<div style="color:var(--dim);font-size:11px;padding:8px">Nessuna chat</div>'
+    return
+  }
+  // Group by project
+  const byProj = {}
+  for (const c of _chats) {
+    const k = c.project || '__none__'
+    if (!byProj[k]) byProj[k] = []
+    byProj[k].push(c)
+  }
+  const projKeys = Object.keys(byProj).filter(k=>k!=='__none__').sort()
+  const allKeys  = [...projKeys, '__none__']
+  for (const k of allKeys) {
+    const group = byProj[k]
+    if (!group || !group.length) continue
+    if (k !== '__none__') {
+      const lbl = document.createElement('div')
+      lbl.className = 'chat-group-label'
+      lbl.textContent = '◈ ' + k
+      list.appendChild(lbl)
+    }
+    for (const c of group) {
+      const row = document.createElement('div')
+      row.className = 'chat-row' + (c.id === _activeChatId ? ' active' : '')
+      const d = c.updated_at ? new Date(c.updated_at*1000) : null
+      const ts = d ? d.toLocaleDateString('it-IT',{month:'short',day:'numeric'}) : ''
+      const mc = c.message_count ? ` · ${c.message_count} msg` : ''
+      const projBadge = (c.project && k === '__none__') ? `<div class="chat-row-proj">${esc(c.project)}</div>` : ''
+      row.innerHTML =
+        `<div class="chat-row-body" data-id="${c.id}">
+          <div class="chat-row-title" id="ct-${c.id}">${esc(c.title)}</div>
+          <div class="chat-row-meta">${ts}${mc}</div>
+          ${projBadge}
+        </div>
+        <button class="chat-del" title="Elimina" data-del="${c.id}">✕</button>`
+      list.appendChild(row)
+    }
+  }
+  // Event delegation
+  list.onclick = e => {
+    const body = e.target.closest('.chat-row-body')
+    if (body) { wsSend({type:'chat_action',action:'switch',chat_id:body.dataset.id}); return }
+    const del = e.target.closest('.chat-del')
+    if (del && confirm('Eliminare questa chat?'))
+      wsSend({type:'chat_action',action:'delete',chat_id:del.dataset.del})
+  }
+  list.ondblclick = e => {
+    const body = e.target.closest('.chat-row-body')
+    if (!body) return
+    const id = body.dataset.id
+    const c = _chats.find(x=>x.id===id)
+    if (c) startRenameChat(id, c.title)
+  }
+}
+
+function startRenameChat(id, currentTitle) {
+  const titleEl = $('ct-'+id)
+  if (!titleEl) return
+  const inp = document.createElement('input')
+  inp.className = 'chat-title-input'
+  inp.value = currentTitle
+  titleEl.replaceWith(inp)
+  inp.focus(); inp.select()
+  const finish = () => {
+    const v = inp.value.trim()
+    if (v && v !== currentTitle) wsSend({type:'chat_action',action:'rename',chat_id:id,title:v})
+  }
+  inp.addEventListener('blur', finish)
+  inp.addEventListener('keydown', e => {
+    if (e.key==='Enter')  { e.preventDefault(); inp.blur() }
+    if (e.key==='Escape') { inp.value=currentTitle; inp.blur() }
+  })
+}
+
+function renderProjChats(projName) {
+  const sec  = $('pp-chats-section')
+  const list = $('pp-chat-list')
+  const proj_chats = _chats.filter(c => c.project === projName)
+  if (!proj_chats.length) { sec.style.display='none'; return }
+  sec.style.display = 'block'
+  list.innerHTML = ''
+  for (const c of proj_chats) {
+    const row = document.createElement('div')
+    row.className = 'pp-chat-row' + (c.id===_activeChatId ? ' active-chat' : '')
+    row.innerHTML = `<span>💬</span><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(c.title)}</span>`
+    row.onclick = () => { wsSend({type:'chat_action',action:'switch',chat_id:c.id}); $('proj-panel').classList.remove('open') }
+    list.appendChild(row)
+  }
 }
 
 /* ── Scroll management ── */
@@ -883,6 +1250,21 @@ function handle(msg) {
     case 'project_state':
       applyProjectState(msg)
       break
+    case 'chat_list':
+      _chats = msg.chats || []
+      renderSidebar()
+      // Re-render proj chats if panel open
+      if (_projState.active) renderProjChats(_projState.active)
+      break
+    case 'chat_state':
+      _activeChatId = msg.chat_id
+      renderSidebar()
+      break
+    case 'chat_title_update': {
+      const cc = _chats.find(x=>x.id===msg.chat_id)
+      if (cc) { cc.title = msg.title; renderSidebar() }
+      break
+    }
   }
 }
 
@@ -986,20 +1368,22 @@ function applyProjectState(s) {
     descEl.textContent = s.description || ''
     memSec.style.display = 'block'
     closeBtn.style.display = 'block'
-    renderMemory(s.memory || {})
+    renderMemory(s.memory || {}, s.memory_meta || {})
+    renderProjChats(s.active)
   } else {
     noProj.style.display = 'block'
     nameEl.style.display = 'none'
     descEl.textContent = ''
     memSec.style.display = 'none'
     closeBtn.style.display = 'none'
+    $('pp-chats-section').style.display = 'none'
   }
 
   // Projects list
   renderProjectsList(s.projects || [])
 }
 
-function renderMemory(mem) {
+function renderMemory(mem, meta) {
   const list = $('pp-mem-list')
   list.innerHTML = ''
   const keys = Object.keys(mem)
@@ -1008,11 +1392,19 @@ function renderMemory(mem) {
     return
   }
   for (const k of keys) {
+    const m = meta && meta[k]
+    const chat = m && m.chat_id ? _chats.find(c=>c.id===m.chat_id) : null
+    const chatLabel = chat ? chat.title : null
     const row = document.createElement('div')
     row.className = 'mem-row'
     row.innerHTML = `
-      <span class="mem-key">${esc(k)}</span>
-      <span class="mem-val">${esc(String(mem[k]))}</span>
+      <div style="flex:1;min-width:0">
+        <div style="display:flex;align-items:baseline;gap:6px;flex-wrap:wrap">
+          <span class="mem-key">${esc(k)}</span>
+          ${chatLabel ? `<span class="mem-chat" title="Impostato da: ${esc(chatLabel)}">↤ ${esc(chatLabel)}</span>` : ''}
+        </div>
+        <div class="mem-val" style="margin-top:2px">${esc(String(mem[k]))}</div>
+      </div>
       <button class="mem-del" title="Rimuovi" onclick="delMem('${esc(k).replace(/'/g,"\\'")}')">✕</button>
     `
     list.appendChild(row)
